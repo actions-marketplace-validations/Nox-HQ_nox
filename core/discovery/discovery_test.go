@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/nox-hq/nox/core/lexctx"
 )
 
 // ---------------------------------------------------------------------------
@@ -71,9 +73,11 @@ func TestDefaultClassifier_AIComponent(t *testing.T) {
 		{"system.prompt", AIComponent},
 		{"system.prompt.md", AIComponent},
 		{"prompts/security.txt", AIComponent},
-		{"agents/scanner.go", AIComponent},
+		// Recognised source under prompts/ or agents/ is Source, not AIComponent,
+		// so taint/SAST/agentflow actually scan it. Non-source (.txt) stays AI.
+		{"agents/scanner.go", Source},
 		{"deep/nested/prompts/foo.txt", AIComponent},
-		{"deep/nested/agents/bar.py", AIComponent},
+		{"deep/nested/agents/bar.py", Source},
 	}
 
 	for _, tc := range cases {
@@ -125,6 +129,9 @@ func TestDefaultClassifier_Source(t *testing.T) {
 		"main.go", "app.py", "index.js", "handler.ts", "gem.rb",
 		"App.java", "lib.rs", "main.c", "engine.cpp", "header.h",
 		"Program.cs", "build.sh",
+		// Groovy source, a non-manifest Gradle script, and the extension-less
+		// Jenkins pipeline file (classified as source by exact name).
+		"Report.groovy", "settings.gradle", "Jenkinsfile", "ci/Jenkinsfile",
 	}
 
 	for _, name := range sources {
@@ -325,6 +332,292 @@ func TestLoadGitignore_IncludesGlobal(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("expected .DS_Store from XDG global, got %v", patterns)
+	}
+}
+
+// Regression for #82: when the scan target is a subdirectory, the
+// walker should still honor the project-root .gitignore. Previously
+// LoadGitignore only consulted the target's own .gitignore, so
+// `nox scan apps/api` would walk apps/api/node_modules even though
+// node_modules was ignored at the repo root.
+func TestLoadGitignore_TraversesAncestorsUpToRepoRoot(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+
+	repoRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(repoRoot, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, ".gitignore"), []byte("node_modules/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	apps := filepath.Join(repoRoot, "apps", "api")
+	if err := os.MkdirAll(apps, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	patterns, err := LoadGitignore(apps)
+	if err != nil {
+		t.Fatalf("LoadGitignore: %v", err)
+	}
+	found := false
+	for _, p := range patterns {
+		if p == "node_modules/" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected repo-root node_modules/ pattern to flow into a sub-target scan; got %v", patterns)
+	}
+}
+
+// Regression for #82: scanning a subdirectory of a repo must actually
+// skip ignored directories during traversal, not just load the
+// patterns. End-to-end check that the walker stops descending into
+// node_modules when the repo-root .gitignore lists it.
+func TestWalker_RespectsRepoRootGitignoreFromSubTarget(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+
+	repoRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(repoRoot, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, ".gitignore"), []byte("node_modules/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// apps/api/node_modules/should-skip.js should NOT be scanned.
+	target := filepath.Join(repoRoot, "apps", "api")
+	if err := os.MkdirAll(filepath.Join(target, "node_modules"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(target, "node_modules", "should-skip.js"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// apps/api/src/keep.go SHOULD be scanned.
+	if err := os.MkdirAll(filepath.Join(target, "src"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(target, "src", "keep.go"), []byte("package x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	w := NewWalker(target)
+	arts, err := w.Walk()
+	if err != nil {
+		t.Fatalf("Walk: %v", err)
+	}
+	have := map[string]bool{}
+	for _, a := range arts {
+		have[a.Path] = true
+	}
+	if have["node_modules/should-skip.js"] {
+		t.Error("repo-root gitignore should have caused node_modules/should-skip.js to be skipped from a sub-target scan")
+	}
+	if !have["src/keep.go"] {
+		t.Error("src/keep.go should still be walked")
+	}
+}
+
+// Regression for #140: in a linked git worktree, `.git` is a gitdir-pointer
+// *file*, not a directory. Joining `.git/info/exclude` onto it yielded an
+// ENOTDIR error that LoadGitignore propagated — discarding every pattern it
+// had already collected from `.gitignore` (a bare `return nil, err`). The
+// walker then saw zero ignore patterns and scanned the whole tree, so a scan
+// run from a worktree found strictly more than the same scan from the real
+// checkout. LoadGitignore must resolve info/exclude via the worktree's
+// commondir (git shares it across worktrees) and still return the
+// `.gitignore` patterns.
+func TestLoadGitignore_WorktreeGitFile(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+
+	// The real checkout: `.git` is a directory with info/exclude.
+	main := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(main, ".git", "info"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(main, ".git", "info", "exclude"), []byte("*.tmp\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A linked worktree: `.git` is a file pointing at the per-worktree
+	// gitdir, which carries a `commondir` back to the main `.git`.
+	wt := t.TempDir()
+	gitDir := filepath.Join(main, ".git", "worktrees", "wt")
+	if err := os.MkdirAll(gitDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(gitDir, "commondir"), []byte("../..\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wt, ".git"), []byte("gitdir: "+gitDir+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The worktree's checked-out `.gitignore` (a tracked file).
+	if err := os.WriteFile(filepath.Join(wt, ".gitignore"), []byte("mobile/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	patterns, err := LoadGitignore(wt)
+	if err != nil {
+		t.Fatalf("LoadGitignore from worktree: %v", err)
+	}
+	var haveMobile, haveTmp bool
+	for _, p := range patterns {
+		switch p {
+		case "mobile/":
+			haveMobile = true
+		case "*.tmp":
+			haveTmp = true
+		}
+	}
+	if !haveMobile {
+		t.Errorf("worktree scan dropped the .gitignore `mobile/` pattern (got %v) — a worktree would scan more than the real checkout", patterns)
+	}
+	if !haveTmp {
+		t.Errorf("worktree scan did not resolve info/exclude via commondir (got %v)", patterns)
+	}
+}
+
+// A config `scan.exclude` (ExcludePatterns) is a HARD exclude: it must win even
+// over a tracked file, unlike a .gitignore pattern. Regression for the #142
+// tracked-override resurrecting excluded-but-tracked files (e.g. nox's own
+// rule-definition files, which are tracked and listed in scan.exclude but were
+// re-scanned under --changed-since, failing the PR gate).
+func TestWalker_ExcludePatternsWinOverTracked(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+
+	root := t.TempDir()
+	mustWrite(t, filepath.Join(root, "rules.go"), "package x // excluded despite tracked")
+	mustWrite(t, filepath.Join(root, "app.go"), "package x")
+
+	w := NewWalker(root)
+	w.ExcludePatterns = []string{"rules.go"}
+	// Both files are tracked — the exclude must still drop rules.go.
+	w.TrackedPaths = map[string]bool{"rules.go": true, "app.go": true}
+
+	arts, err := w.Walk()
+	if err != nil {
+		t.Fatalf("Walk: %v", err)
+	}
+	have := map[string]bool{}
+	for _, a := range arts {
+		have[a.Path] = true
+	}
+	if have["rules.go"] {
+		t.Error("scan.exclude must skip a tracked file (hard exclude wins over the tracked-file override)")
+	}
+	if !have["app.go"] {
+		t.Error("app.go should still be scanned")
+	}
+}
+
+// Regression for #142: git never ignores a *tracked* file, even when a
+// .gitignore pattern matches it. A repo that .gitignores a directory but
+// commits sources into it (pet-medical: `mobile/` ignored, ~80 tracked
+// files under it) must still have those tracked files scanned. The walker
+// honors TrackedPaths: a tracked file under an ignored dir is scanned, the
+// ignored dir is descended into to reach it, but a genuinely-ignored
+// (untracked) sibling stays skipped and an ignored dir with no tracked
+// descendant is still pruned.
+func TestWalker_ScansTrackedFilesUnderIgnoredDir(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, ".gitignore"), []byte("mobile/\nbuild/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// mobile/ is ignored but two files under it are tracked; a third is not.
+	mustWrite(t, filepath.Join(root, "mobile", "app.go"), "package m")         // tracked
+	mustWrite(t, filepath.Join(root, "mobile", "sub", "util.go"), "package s") // tracked (nested)
+	mustWrite(t, filepath.Join(root, "mobile", "generated.go"), "package m")   // ignored + untracked
+	// build/ is ignored and holds no tracked files → must stay pruned.
+	mustWrite(t, filepath.Join(root, "build", "out.go"), "package b")
+	// a normal tracked file outside any ignore.
+	mustWrite(t, filepath.Join(root, "src", "main.go"), "package main")
+
+	w := NewWalker(root)
+	w.TrackedPaths = map[string]bool{
+		"mobile/app.go":      true,
+		"mobile/sub/util.go": true,
+		"src/main.go":        true,
+	}
+	arts, err := w.Walk()
+	if err != nil {
+		t.Fatalf("Walk: %v", err)
+	}
+	have := map[string]bool{}
+	for _, a := range arts {
+		have[a.Path] = true
+	}
+
+	for _, want := range []string{"mobile/app.go", "mobile/sub/util.go", "src/main.go"} {
+		if !have[want] {
+			t.Errorf("tracked file %q under an ignored dir should be scanned; got %v", want, keys(have))
+		}
+	}
+	if have["mobile/generated.go"] {
+		t.Error("mobile/generated.go is ignored and untracked — it should not be scanned")
+	}
+	if have["build/out.go"] {
+		t.Error("build/ is ignored with no tracked files — it should stay pruned")
+	}
+}
+
+func mustWrite(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func keys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
+// Regression for #83: --changed-since must short-circuit the file
+// walk, not just filter the artifact list afterwards. The walker now
+// accepts an IncludePaths allow-list and skips directories that don't
+// contain any included path.
+func TestWalker_IncludePathsRestrictsTraversal(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+
+	root := t.TempDir()
+	// Three files, two of which the caller will mark as "changed".
+	mustWrite := func(rel, body string) {
+		full := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustWrite("src/changed.go", "package x")
+	mustWrite("src/unchanged.go", "package x")
+	mustWrite("other/skip.go", "package x")
+
+	w := NewWalker(root)
+	w.IncludePaths = map[string]bool{
+		"src/changed.go": true,
+	}
+	arts, err := w.Walk()
+	if err != nil {
+		t.Fatalf("Walk: %v", err)
+	}
+
+	if len(arts) != 1 || arts[0].Path != "src/changed.go" {
+		t.Errorf("expected only src/changed.go in artifacts; got %v", arts)
 	}
 }
 
@@ -560,7 +853,7 @@ func TestWalker_ClassifiesFileTypes(t *testing.T) {
 		"src/handler.ts":       Source,
 		"src/utils.py":         Source,
 		"prompts/security.txt": AIComponent,
-		"agents/scanner.go":    AIComponent,
+		"agents/scanner.go":    Source, // source under agents/ must reach taint/SAST
 		"README.md":            Unknown,
 		"build/app.dockerfile": Container,
 		"mcp.json":             AIComponent,
@@ -880,5 +1173,18 @@ func TestMatchPattern_SlashContainingDirOnly(t *testing.T) {
 				t.Errorf("matchPattern(%q, %q) = %v, want %v", tt.path, tt.pattern, got, tt.want)
 			}
 		})
+	}
+}
+
+// Every extension the lexer can analyse must also be classified as Source here,
+// or files nox fully understands get skipped by source-gated rules. This guard
+// fails if sourceExtensions falls behind lexctx again — the exact drift that
+// left .kts/.pyi/.gemspec/etc unscanned.
+func TestSourceExtensionsCoverTheLexer(t *testing.T) {
+	for _, ext := range lexctx.SourceExtensions() {
+		if !sourceExtensions[ext] {
+			t.Errorf("lexer supports %q but discovery does not classify it as Source — "+
+				"add it to sourceExtensions or source-gated rules will skip it", ext)
+		}
 	}
 }

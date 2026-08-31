@@ -1,6 +1,7 @@
 package iac
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -34,13 +35,18 @@ func TestDetect_DockerfileRunsAsRoot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(results) != 1 {
-		t.Fatalf("expected 1 finding, got %d", len(results))
+	// This Dockerfile also legitimately trips the block-scoped absence rules
+	// (no HEALTHCHECK, no maintainer LABEL), so assert on the IAC-001 finding
+	// specifically rather than on the total count.
+	var f *findings.Finding
+	for i := range results {
+		if results[i].RuleID == "IAC-001" {
+			f = &results[i]
+			break
+		}
 	}
-
-	f := results[0]
-	if f.RuleID != "IAC-001" {
-		t.Fatalf("expected RuleID IAC-001, got %s", f.RuleID)
+	if f == nil {
+		t.Fatalf("expected an IAC-001 finding, got %d findings without it", len(results))
 	}
 	if f.Severity != findings.SeverityHigh {
 		t.Fatalf("expected severity high, got %s", f.Severity)
@@ -390,10 +396,17 @@ func TestDetect_KubernetesRunAsRoot(t *testing.T) {
 
 func TestNoFalsePositives_CleanDockerfile(t *testing.T) {
 	a := NewAnalyzer()
+	// A genuinely hardened Dockerfile: pinned base, maintainer label,
+	// --no-install-recommends, --chown on COPY, a non-root USER, a HEALTHCHECK,
+	// and an exec-form CMD. It must produce zero findings — the "hardened →
+	// clean" half of the absence-rule contract, proving those rules do not
+	// false-positive when the property is present.
 	content := []byte(`FROM ubuntu:22.04
-RUN apt-get update && apt-get install -y curl
-COPY . /app
+LABEL maintainer="team@example.com"
+RUN apt-get update && apt-get install -y --no-install-recommends curl
+COPY --chown=appuser:appuser . /app
 USER appuser
+HEALTHCHECK CMD curl -f http://localhost/ || exit 1
 CMD ["/app/start"]
 `)
 
@@ -402,7 +415,7 @@ CMD ["/app/start"]
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(results) != 0 {
-		t.Fatalf("expected 0 findings on clean Dockerfile, got %d", len(results))
+		t.Fatalf("expected 0 findings on clean Dockerfile, got %d: %v", len(results), ruleIDs(results))
 	}
 }
 
@@ -429,6 +442,10 @@ func TestNoFalsePositives_CleanTerraform(t *testing.T) {
 
 func TestNoFalsePositives_CleanKubernetes(t *testing.T) {
 	a := NewAnalyzer()
+	// A hardened Pod: non-root securityContext with seccompProfile, resource
+	// requests/limits, and liveness/readiness probes. All the container-level
+	// absence rules (IAC-135/137/138/139/140/145) must stay silent — the
+	// "hardened → clean" control for Kubernetes.
 	content := []byte(`apiVersion: v1
 kind: Pod
 spec:
@@ -439,6 +456,23 @@ spec:
       runAsNonRoot: true
       allowPrivilegeEscalation: false
       privileged: false
+      seccompProfile:
+        type: RuntimeDefault
+    livenessProbe:
+      httpGet:
+        path: /
+        port: 80
+    readinessProbe:
+      httpGet:
+        path: /
+        port: 80
+    resources:
+      limits:
+        cpu: "1"
+        memory: 256Mi
+      requests:
+        cpu: "500m"
+        memory: 128Mi
 `)
 
 	results, err := a.ScanFile("pod.yaml", content)
@@ -446,7 +480,7 @@ spec:
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(results) != 0 {
-		t.Fatalf("expected 0 findings on clean K8s manifest, got %d", len(results))
+		t.Fatalf("expected 0 findings on clean K8s manifest, got %d: %v", len(results), ruleIDs(results))
 	}
 }
 
@@ -503,7 +537,7 @@ func TestScanArtifacts_MixedIaCFiles(t *testing.T) {
 	}
 
 	a := NewAnalyzer()
-	fs, err := a.ScanArtifacts(artifacts)
+	fs, err := a.ScanArtifacts(context.Background(), artifacts)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -545,7 +579,7 @@ func TestScanArtifacts_UnreadableFile(t *testing.T) {
 	}
 
 	a := NewAnalyzer()
-	_, err := a.ScanArtifacts(artifacts)
+	_, err := a.ScanArtifacts(context.Background(), artifacts)
 	if err == nil {
 		t.Fatal("expected error for unreadable file")
 	}
@@ -582,13 +616,26 @@ func TestDetect_CustomDockerfileExtension(t *testing.T) {
 
 func TestAllIaCRules_Count(t *testing.T) {
 	rules := builtinIaCRules()
-	if got := len(rules); got != 500 {
-		t.Errorf("expected 500 IaC rules, got %d", got)
+	// 490, not 500: ten duplicate IDs were retired in #394 (see
+	// knownDuplicateRulePairs). Each lives on as an alias on the rule that
+	// absorbed it, so the drop is in rule COUNT only, not in coverage.
+	if got := len(rules); got != 490 {
+		t.Errorf("expected 490 IaC rules, got %d", got)
 	}
 }
 
 func TestAllIaCRules_Compile(t *testing.T) {
 	for _, r := range builtinIaCRules() {
+		// Absence rules carry their detection in the Absence* fields, not in
+		// Pattern (see convertIaCRules). Their patterns are validated separately
+		// by TestAbsenceRulePatternsCompile; here we only require that they have
+		// a working anchor+property pair rather than a Pattern.
+		if r.MatcherType == "absence" {
+			if r.AbsenceAnchor == "" || r.AbsenceProperty == "" {
+				t.Errorf("absence rule %s missing anchor or property", r.ID)
+			}
+			continue
+		}
 		if r.Pattern == "" {
 			t.Errorf("rule %s has empty pattern", r.ID)
 		}

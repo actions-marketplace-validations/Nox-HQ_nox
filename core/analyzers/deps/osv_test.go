@@ -36,196 +36,6 @@ func decodeJSON(t *testing.T, r *http.Request, v any) {
 // queryOSV tests
 // ---------------------------------------------------------------------------
 
-func TestQueryOSV_BatchQuery(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/querybatch" {
-			t.Errorf("unexpected path: %s", r.URL.Path)
-			http.Error(w, "not found", http.StatusNotFound)
-			return
-		}
-
-		var req osvBatchRequest
-		decodeJSON(t, r, &req)
-
-		// Return vulns for lodash and express, none for others.
-		results := make([]osvBatchResult, len(req.Queries))
-		for i, q := range req.Queries {
-			switch q.Package.Name {
-			case "lodash":
-				results[i] = osvBatchResult{
-					Vulns: []osvVuln{
-						{
-							ID:      "GHSA-1234-5678-9012",
-							Summary: "Prototype pollution in lodash",
-							Severity: []osvSeverity{
-								{Type: "CVSS_V3", Score: "7.5"},
-							},
-							Aliases: []string{"CVE-2020-28500"},
-						},
-					},
-				}
-			case "express":
-				results[i] = osvBatchResult{
-					Vulns: []osvVuln{
-						{
-							ID:      "GHSA-abcd-efgh-ijkl",
-							Summary: "Path traversal in express",
-							Severity: []osvSeverity{
-								{Type: "CVSS_V3", Score: "9.1"},
-							},
-							Aliases: []string{"CVE-2024-1234"},
-						},
-					},
-				}
-			}
-		}
-
-		encodeJSON(t, w, osvBatchResponse{Results: results})
-	}))
-	defer srv.Close()
-
-	pkgs := []Package{
-		{Name: "express", Version: "4.17.1", Ecosystem: "npm"},
-		{Name: "react", Version: "18.0.0", Ecosystem: "npm"},
-		{Name: "lodash", Version: "4.17.20", Ecosystem: "npm"},
-	}
-
-	result, err := queryOSV(context.Background(), srv.Client(), srv.URL, pkgs)
-	if err != nil {
-		t.Fatalf("queryOSV returned error: %v", err)
-	}
-
-	// express (index 0) and lodash (index 2) should have vulns.
-	if len(result[0]) != 1 {
-		t.Fatalf("expected 1 vuln for express, got %d", len(result[0]))
-	}
-	if result[0][0].ID != "GHSA-abcd-efgh-ijkl" {
-		t.Errorf("expected GHSA-abcd-efgh-ijkl, got %s", result[0][0].ID)
-	}
-
-	if len(result[1]) != 0 {
-		t.Fatalf("expected 0 vulns for react, got %d", len(result[1]))
-	}
-
-	if len(result[2]) != 1 {
-		t.Fatalf("expected 1 vuln for lodash, got %d", len(result[2]))
-	}
-	if result[2][0].ID != "GHSA-1234-5678-9012" {
-		t.Errorf("expected GHSA-1234-5678-9012, got %s", result[2][0].ID)
-	}
-}
-
-func TestQueryOSV_LargeBatch(t *testing.T) {
-	var requestCount atomic.Int32
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestCount.Add(1)
-
-		var req osvBatchRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "bad request", http.StatusBadRequest)
-			return
-		}
-
-		// Each batch should have at most 1000 queries.
-		if len(req.Queries) > osvBatchLimit {
-			t.Errorf("batch size %d exceeds limit %d", len(req.Queries), osvBatchLimit)
-		}
-
-		results := make([]osvBatchResult, len(req.Queries))
-		encodeJSON(t, w, osvBatchResponse{Results: results})
-	}))
-	defer srv.Close()
-
-	// Create 1500 packages to trigger 2 batches.
-	pkgs := make([]Package, 1500)
-	for i := range pkgs {
-		pkgs[i] = Package{Name: "pkg", Version: "1.0.0", Ecosystem: "npm"}
-	}
-
-	_, err := queryOSV(context.Background(), srv.Client(), srv.URL, pkgs)
-	if err != nil {
-		t.Fatalf("queryOSV returned error: %v", err)
-	}
-
-	if requestCount.Load() != 2 {
-		t.Fatalf("expected 2 batch requests, got %d", requestCount.Load())
-	}
-}
-
-func TestQueryOSV_NetworkError(t *testing.T) {
-	// Use a server that immediately closes the connection.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		hj, ok := w.(http.Hijacker)
-		if !ok {
-			http.Error(w, "not a hijacker", http.StatusInternalServerError)
-			return
-		}
-		conn, _, _ := hj.Hijack()
-		_ = conn.Close()
-	}))
-	defer srv.Close()
-
-	pkgs := []Package{
-		{Name: "express", Version: "4.17.1", Ecosystem: "npm"},
-	}
-
-	result, err := queryOSV(context.Background(), srv.Client(), srv.URL, pkgs)
-	if err != nil {
-		t.Fatalf("expected graceful degradation, got error: %v", err)
-	}
-
-	// Should return empty result, not an error.
-	if len(result) != 0 {
-		t.Fatalf("expected 0 results on network error, got %d", len(result))
-	}
-}
-
-func TestQueryOSV_EmptyResponse(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req osvBatchRequest
-		decodeJSON(t, r, &req)
-
-		results := make([]osvBatchResult, len(req.Queries))
-		encodeJSON(t, w, osvBatchResponse{Results: results})
-	}))
-	defer srv.Close()
-
-	pkgs := []Package{
-		{Name: "express", Version: "4.18.2", Ecosystem: "npm"},
-		{Name: "lodash", Version: "4.17.21", Ecosystem: "npm"},
-	}
-
-	result, err := queryOSV(context.Background(), srv.Client(), srv.URL, pkgs)
-	if err != nil {
-		t.Fatalf("queryOSV returned error: %v", err)
-	}
-
-	if len(result) != 0 {
-		t.Fatalf("expected 0 results when no vulns found, got %d", len(result))
-	}
-}
-
-func TestQueryOSV_Non200Status(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		http.Error(w, "internal error", http.StatusInternalServerError)
-	}))
-	defer srv.Close()
-
-	pkgs := []Package{
-		{Name: "express", Version: "4.17.1", Ecosystem: "npm"},
-	}
-
-	result, err := queryOSV(context.Background(), srv.Client(), srv.URL, pkgs)
-	if err != nil {
-		t.Fatalf("expected graceful degradation, got error: %v", err)
-	}
-
-	if len(result) != 0 {
-		t.Fatalf("expected 0 results on 500 status, got %d", len(result))
-	}
-}
-
 // ---------------------------------------------------------------------------
 // mapOSVSeverity tests
 // ---------------------------------------------------------------------------
@@ -297,17 +107,92 @@ func TestMapOSVSeverity(t *testing.T) {
 			expected: findings.SeverityMedium,
 		},
 		{
-			name:     "CVSS vector string (not a number)",
+			// OSV publishes CVSS as a vector string. The base score is fully
+			// determined by the vector, so it is computed rather than defaulted
+			// to medium; this is the canonical 9.8 critical vector.
+			name:     "CVSS v3 vector string",
 			input:    []osvSeverity{{Type: "CVSS_V3", Score: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}},
+			expected: findings.SeverityCritical,
+		},
+		{
+			// v2 vectors use a different formula and are not computed; keep the
+			// conservative default rather than guessing.
+			// A v2 vector cannot be scored and there is no label to fall back
+			// to, so medium here means "unknown" — not "this is a medium
+			// vulnerability". The companion case in
+			// TestMapOSVSeverity_FallsBackToLabel covers what happens when a
+			// label IS available, which is where this previously went wrong.
+			name:     "unscorable CVSS v2 vector with no label is unknown",
+			input:    []osvSeverity{{Type: "CVSS_V2", Score: "AV:N/AC:L/Au:N/C:P/I:P/A:P"}},
 			expected: findings.SeverityMedium,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := mapOSVSeverity(tt.input)
+			result := mapOSVSeverity(tt.input, osvDatabaseSpecific{})
 			if result != tt.expected {
 				t.Errorf("expected %s, got %s", tt.expected, result)
+			}
+		})
+	}
+}
+
+// TestMapOSVSeverity_FallsBackToLabel covers the precedence between a CVSS
+// entry and the source database's coarse label.
+//
+// The rule is "most precise signal wins", and the trap is that presence of a
+// CVSS entry is not the same as being able to score it. Returning on any
+// CVSS_V2/V3 entry meant an unscorable vector beat an accurate label, so
+// advisories that plainly said CRITICAL were reported as medium.
+func TestMapOSVSeverity_FallsBackToLabel(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		sev      []osvSeverity
+		label    string
+		expected findings.Severity
+	}{
+		{
+			name:     "unscorable v2 vector yields to the label",
+			sev:      []osvSeverity{{Type: "CVSS_V2", Score: "AV:N/AC:L/Au:N/C:P/I:P/A:P"}},
+			label:    "CRITICAL",
+			expected: findings.SeverityCritical,
+		},
+		{
+			name:     "v4-only advisory uses the label",
+			sev:      []osvSeverity{{Type: "CVSS_V4", Score: "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N"}},
+			label:    "HIGH",
+			expected: findings.SeverityHigh,
+		},
+		{
+			name:     "a scorable v3 vector beats the label",
+			sev:      []osvSeverity{{Type: "CVSS_V3", Score: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}},
+			label:    "LOW",
+			expected: findings.SeverityCritical,
+		},
+		{
+			name:     "github MODERATE means medium",
+			label:    "MODERATE",
+			expected: findings.SeverityMedium,
+		},
+		{
+			name:     "unrecognised label is unknown",
+			label:    "SPICY",
+			expected: findings.SeverityMedium,
+		},
+		{
+			name:     "no signal at all is unknown",
+			expected: findings.SeverityMedium,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := mapOSVSeverity(tt.sev, osvDatabaseSpecific{Severity: tt.label})
+			if got != tt.expected {
+				t.Errorf("expected %s, got %s", tt.expected, got)
 			}
 		})
 	}
@@ -317,49 +202,243 @@ func TestMapOSVSeverity(t *testing.T) {
 // fixedVersion tests
 // ---------------------------------------------------------------------------
 
-func TestFixedVersion_ExtractsFromAffected(t *testing.T) {
+// affected builds one osvAffected entry with a single range from the given
+// events, so the table below reads as version ranges rather than JSON shapes.
+func affected(name, eco string, events ...osvEvent) osvAffected {
+	return osvAffected{
+		Package: osvPackage{Name: name, Ecosystem: eco},
+		Ranges:  []osvRange{{Type: "SEMVER", Events: events}},
+	}
+}
+
+// TestFixedVersion covers the selection of a fix version out of an advisory's
+// affected ranges.
+//
+// The case that matters is an advisory with more than one range: reporting a
+// fix from a range the installed version is not in tells the operator to move
+// to a version *below* the one they are running. A security scanner that
+// recommends a downgrade is worse than one that says nothing, so every case
+// where the covering range cannot be identified expects "".
+func TestFixedVersion(t *testing.T) {
 	t.Parallel()
 
-	v := osvVuln{
-		ID: "CVE-2024-1234",
-		Affected: []osvAffected{{
-			Package: osvPackage{Name: "github.com/foo/bar", Ecosystem: "Go"},
-			Ranges: []osvRange{{
-				Type: "SEMVER",
-				Events: []osvEvent{
-					{Introduced: "0"},
-					{Fixed: "1.2.4"},
+	// The real GHSA-47m2-4cr7-mhcw, which is how this was found: two affected
+	// entries, one per maintained release branch.
+	quicGo := []osvAffected{
+		affected("github.com/quic-go/quic-go", "Go", osvEvent{Introduced: "0"}, osvEvent{Fixed: "0.49.1"}),
+		affected("github.com/quic-go/quic-go", "Go", osvEvent{Introduced: "0.50.0"}, osvEvent{Fixed: "0.54.1"}),
+	}
+
+	tests := []struct {
+		name      string
+		affected  []osvAffected
+		pkg, eco  string
+		installed string
+		want      string
+	}{
+		{
+			name:      "single range covering the installed version",
+			affected:  []osvAffected{affected("github.com/foo/bar", "Go", osvEvent{Introduced: "0"}, osvEvent{Fixed: "1.2.4"})},
+			pkg:       "github.com/foo/bar",
+			eco:       "go",
+			installed: "v1.2.0",
+			want:      "1.2.4",
+		},
+		{
+			name:      "GHSA-47m2-4cr7-mhcw: installed on the maintained branch",
+			affected:  quicGo,
+			pkg:       "github.com/quic-go/quic-go",
+			eco:       "go",
+			installed: "v0.54.0",
+			want:      "0.54.1",
+		},
+		{
+			name:      "GHSA-47m2-4cr7-mhcw: installed in the first range",
+			affected:  quicGo,
+			pkg:       "github.com/quic-go/quic-go",
+			eco:       "go",
+			installed: "v0.30.2",
+			want:      "0.49.1",
+		},
+		{
+			name:      "installed between two ranges is covered by neither",
+			affected:  quicGo,
+			pkg:       "github.com/quic-go/quic-go",
+			eco:       "go",
+			installed: "v0.49.5",
+			want:      "",
+		},
+		{
+			name:      "installed above every range",
+			affected:  quicGo,
+			pkg:       "github.com/quic-go/quic-go",
+			eco:       "go",
+			installed: "v1.0.0",
+			want:      "",
+		},
+		{
+			name: "two ranges inside one affected entry",
+			affected: []osvAffected{{
+				Package: osvPackage{Name: "p", Ecosystem: "npm"},
+				Ranges: []osvRange{
+					{Type: "SEMVER", Events: []osvEvent{{Introduced: "0"}, {Fixed: "1.9.2"}}},
+					{Type: "SEMVER", Events: []osvEvent{{Introduced: "2.0.0"}, {Fixed: "2.4.1"}}},
 				},
 			}},
-		}},
+			pkg:       "p",
+			eco:       "npm",
+			installed: "2.3.0",
+			want:      "2.4.1",
+		},
+		{
+			name: "four events in one range",
+			affected: []osvAffected{{
+				Package: osvPackage{Name: "p", Ecosystem: "npm"},
+				Ranges: []osvRange{{Type: "SEMVER", Events: []osvEvent{
+					{Introduced: "0"}, {Fixed: "1.9.2"},
+					{Introduced: "2.0.0"}, {Fixed: "2.4.1"},
+				}}},
+			}},
+			pkg:       "p",
+			eco:       "npm",
+			installed: "2.3.0",
+			want:      "2.4.1",
+		},
+		{
+			name:      "single range with no fix event",
+			affected:  []osvAffected{affected("p", "npm", osvEvent{Introduced: "0"})},
+			pkg:       "p",
+			eco:       "npm",
+			installed: "1.0.0",
+			want:      "",
+		},
+		{
+			// The branch the operator is on is still unfixed; the older branch
+			// has a fix. Reporting it would be the downgrade this test exists
+			// to prevent.
+			name: "covering range is unfixed while an earlier range is fixed",
+			affected: []osvAffected{
+				affected("p", "npm", osvEvent{Introduced: "0"}, osvEvent{Fixed: "1.5.0"}),
+				affected("p", "npm", osvEvent{Introduced: "2.0.0"}),
+			},
+			pkg:       "p",
+			eco:       "npm",
+			installed: "2.1.0",
+			want:      "",
+		},
+		{
+			name: "last_affected names no fix",
+			affected: []osvAffected{
+				affected("p", "npm", osvEvent{Introduced: "0"}, osvEvent{Fixed: "1.5.0"}),
+				affected("p", "npm", osvEvent{Introduced: "2.0.0"}, osvEvent{LastAffected: "2.9.9"}),
+			},
+			pkg:       "p",
+			eco:       "npm",
+			installed: "2.5.0",
+			want:      "",
+		},
+		{
+			name:      "v prefix on the advisory's own versions",
+			affected:  []osvAffected{affected("m", "Go", osvEvent{Introduced: "v1.0.0"}, osvEvent{Fixed: "v1.4.0"}), affected("m", "Go", osvEvent{Introduced: "v2.0.0"}, osvEvent{Fixed: "v2.1.0"})},
+			pkg:       "m",
+			eco:       "go",
+			installed: "v2.0.3",
+			want:      "v2.1.0",
+		},
+		{
+			// A prerelease sorts below its release, so v0.54.1-rc.1 is still
+			// inside [0.50.0, 0.54.1) and the fix still applies.
+			name:      "prerelease of the fix version is still affected",
+			affected:  quicGo,
+			pkg:       "github.com/quic-go/quic-go",
+			eco:       "go",
+			installed: "v0.54.1-rc.1",
+			want:      "0.54.1",
+		},
+		{
+			name:      "prerelease of the introduced version is below the range",
+			affected:  quicGo,
+			pkg:       "github.com/quic-go/quic-go",
+			eco:       "go",
+			installed: "v0.50.0-beta1",
+			want:      "",
+		},
+		{
+			name:      "installed version carries no usable ordering",
+			affected:  quicGo,
+			pkg:       "github.com/quic-go/quic-go",
+			eco:       "go",
+			installed: "latest",
+			want:      "",
+		},
+		{
+			name:      "installed version is empty",
+			affected:  quicGo,
+			pkg:       "github.com/quic-go/quic-go",
+			eco:       "go",
+			installed: "",
+			want:      "",
+		},
+		{
+			name:      "non-matching package",
+			affected:  []osvAffected{affected("other", "Go", osvEvent{Fixed: "1.0.0"})},
+			pkg:       "github.com/foo/bar",
+			eco:       "go",
+			installed: "0.1.0",
+			want:      "",
+		},
+		{
+			name:      "matching name in a different ecosystem",
+			affected:  []osvAffected{affected("p", "npm", osvEvent{Introduced: "0"}, osvEvent{Fixed: "1.0.0"})},
+			pkg:       "p",
+			eco:       "pypi",
+			installed: "0.9.0",
+			want:      "",
+		},
+		{
+			name:      "no affected entries at all",
+			affected:  nil,
+			pkg:       "p",
+			eco:       "npm",
+			installed: "1.0.0",
+			want:      "",
+		},
 	}
-	got := fixedVersion(&v, "github.com/foo/bar", "go")
-	if got != "1.2.4" {
-		t.Errorf("expected 1.2.4, got %q", got)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			v := osvVuln{ID: "CVE-2024-1234", Affected: tt.affected}
+			if got := fixedVersion(&v, tt.pkg, tt.eco, tt.installed); got != tt.want {
+				t.Errorf("fixedVersion(%s@%s) = %q, want %q", tt.pkg, tt.installed, got, tt.want)
+			}
+		})
 	}
 }
 
-func TestFixedVersion_NoMatch(t *testing.T) {
+// TestFixedVersion_NeverBelowInstalled is the property the table above encodes
+// case by case: whatever fixedVersion returns for a comparable installed
+// version, acting on it must never be a downgrade.
+func TestFixedVersion_NeverBelowInstalled(t *testing.T) {
 	t.Parallel()
 
-	v := osvVuln{Affected: []osvAffected{{
-		Package: osvPackage{Name: "other", Ecosystem: "Go"},
-		Ranges:  []osvRange{{Events: []osvEvent{{Fixed: "1.0.0"}}}},
-	}}}
-	if got := fixedVersion(&v, "github.com/foo/bar", "go"); got != "" {
-		t.Errorf("expected empty for non-matching package, got %q", got)
-	}
-}
+	v := osvVuln{Affected: []osvAffected{
+		affected("github.com/quic-go/quic-go", "Go", osvEvent{Introduced: "0"}, osvEvent{Fixed: "0.49.1"}),
+		affected("github.com/quic-go/quic-go", "Go", osvEvent{Introduced: "0.50.0"}, osvEvent{Fixed: "0.54.1"}),
+		affected("github.com/quic-go/quic-go", "Go", osvEvent{Introduced: "0.55.0"}, osvEvent{Fixed: "0.55.3"}),
+	}}
 
-func TestFixedVersion_NoFixEvent(t *testing.T) {
-	t.Parallel()
-
-	v := osvVuln{Affected: []osvAffected{{
-		Package: osvPackage{Name: "p", Ecosystem: "npm"},
-		Ranges:  []osvRange{{Events: []osvEvent{{Introduced: "0"}}}},
-	}}}
-	if got := fixedVersion(&v, "p", "npm"); got != "" {
-		t.Errorf("expected empty for unfixed vuln, got %q", got)
+	for _, installed := range []string{
+		"v0.1.0", "v0.49.0", "v0.49.1", "v0.50.0", "v0.53.9",
+		"v0.54.0", "v0.54.1", "v0.55.0", "v0.55.2", "v0.55.3", "v1.0.0",
+	} {
+		fix := fixedVersion(&v, "github.com/quic-go/quic-go", "go", installed)
+		if fix == "" {
+			continue
+		}
+		if compareGoVersions(fix, installed) <= 0 {
+			t.Errorf("installed %s reported as fixed in %s — following that is a downgrade", installed, fix)
+		}
 	}
 }
 
@@ -417,6 +496,12 @@ func TestEcosystemToOSV(t *testing.T) {
 func TestScanArtifacts_WithOSV(t *testing.T) {
 	// Mock OSV server returning a vulnerability for lodash.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Detail lookups (/v1/vulns/{id}) carry no body and are answered 404;
+		// hydration fails open, leaving the batch result as the test expects.
+		if strings.HasPrefix(r.URL.Path, "/v1/vulns/") {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
 		var req osvBatchRequest
 		decodeJSON(t, r, &req)
 
@@ -467,7 +552,7 @@ func TestScanArtifacts_WithOSV(t *testing.T) {
 	}
 
 	analyzer := NewAnalyzer(WithOSVBaseURL(srv.URL), WithHTTPClient(srv.Client()))
-	inventory, fs, err := analyzer.ScanArtifacts(artifacts)
+	inventory, fs, err := analyzer.ScanArtifacts(context.Background(), artifacts)
 	if err != nil {
 		t.Fatalf("ScanArtifacts returned error: %v", err)
 	}
@@ -552,7 +637,7 @@ func TestScanArtifacts_OSVDisabled(t *testing.T) {
 	}
 
 	analyzer := NewAnalyzer(WithOSVDisabled(), WithOSVBaseURL(srv.URL), WithHTTPClient(srv.Client()))
-	inventory, fs, err := analyzer.ScanArtifacts(artifacts)
+	inventory, fs, err := analyzer.ScanArtifacts(context.Background(), artifacts)
 	if err != nil {
 		t.Fatalf("ScanArtifacts returned error: %v", err)
 	}
@@ -573,6 +658,12 @@ func TestScanArtifacts_OSVDisabled(t *testing.T) {
 
 func TestScanArtifacts_VulnerabilityMetadata(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Detail lookups (/v1/vulns/{id}) carry no body and are answered 404;
+		// hydration fails open, leaving the batch result as the test expects.
+		if strings.HasPrefix(r.URL.Path, "/v1/vulns/") {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
 		var req osvBatchRequest
 		decodeJSON(t, r, &req)
 
@@ -616,7 +707,7 @@ func TestScanArtifacts_VulnerabilityMetadata(t *testing.T) {
 	}
 
 	analyzer := NewAnalyzer(WithOSVBaseURL(srv.URL), WithHTTPClient(srv.Client()))
-	_, fs, err := analyzer.ScanArtifacts(artifacts)
+	_, fs, err := analyzer.ScanArtifacts(context.Background(), artifacts)
 	if err != nil {
 		t.Fatalf("ScanArtifacts returned error: %v", err)
 	}

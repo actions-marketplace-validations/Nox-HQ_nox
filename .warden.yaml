@@ -1,0 +1,49 @@
+# warden gate for nox.
+#
+# nox already has strong CI: a three-OS test matrix, lint, metamorphic
+# invariance, a dependency CVE audit and SLSA provenance. This gate is not a
+# replacement for any of that. It exists because CI reports after a push, and
+# the cheapest place to find a broken test is before the push happens — which
+# is also the only place a secret can still be caught before it reaches a
+# public remote.
+#
+# TIMINGS, measured rather than guessed (2026-08-28, warm cache):
+#   go test ./...          20s
+#   golangci-lint run      51s
+#
+# So lint is deliberately NOT on pre-commit. A 51-second pause on every commit
+# is how a gate becomes something people pass --no-verify to, and a gate that
+# is routinely bypassed protects nothing. Commits get the fast checks; the
+# expensive ones run once, at push.
+status:
+  enabled: true
+hooks: {pre_commit: true, pre_push: true}
+commands:
+  lint: "golangci-lint run ./..."
+  test: "go test ./... -count=1"
+  # nox scanning itself. The self-scan is the honest test of the product: if it
+  # cannot run clean against its own tree, the tree is what needs fixing.
+  # .nox.yaml already carries the exclusions this repository has argued its way
+  # to, including the deliberately-vulnerable fixture corpora.
+  self-scan: "go run ./cli scan . -severity-threshold high"
+  # The pre-commit secret check, run by nox rather than warden's built-in
+  # `credentials` step.
+  #
+  # The built-in fires on this repository's own CHANGELOG. Line 1127 explains
+  # that SEC-004 used to report critical on an HTML placeholder holding a PEM
+  # header — and to explain it, quotes the header. The built-in has no path
+  # scoping and no waiver mechanism, so the only escape it offers is deleting
+  # the step, which would trade a real check for a documentation artefact.
+  #
+  # nox is this repository's product and the better scanner for it: the same
+  # detections, plus rule IDs, `nox:ignore` waivers and a baseline. `-staged`
+  # keeps it to the index, which measured at 0.36s — well inside a pre-commit
+  # budget (0.45s measured). Nothing is weakened: pre-push still runs self-scan across the whole
+  # tree at the same threshold.
+  secrets: "go run ./cli scan . -staged -severity-threshold high"
+steps:
+  # A secret check at pre-commit is the one whose absence is irreversible: a
+  # pushed secret is a leaked secret whatever happens next.
+  pre_commit: [secrets]
+  pre_push: [test, lint, self-scan]
+parallel: true

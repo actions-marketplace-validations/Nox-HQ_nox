@@ -1,6 +1,7 @@
 package deps
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"sort"
@@ -485,7 +486,7 @@ FROM alpine@sha256:abcdef1234567890
 	}
 
 	analyzer := NewAnalyzer(WithOSVDisabled())
-	inventory, fs, err := analyzer.ScanArtifacts(artifacts)
+	inventory, fs, err := analyzer.ScanArtifacts(context.Background(), artifacts)
 	if err != nil {
 		t.Fatalf("ScanArtifacts returned error: %v", err)
 	}
@@ -559,7 +560,7 @@ COPY dist/ /usr/share/nginx/html/
 	}
 
 	analyzer := NewAnalyzer(WithOSVDisabled())
-	inventory, fs, err := analyzer.ScanArtifacts(artifacts)
+	inventory, fs, err := analyzer.ScanArtifacts(context.Background(), artifacts)
 	if err != nil {
 		t.Fatalf("ScanArtifacts returned error: %v", err)
 	}
@@ -613,7 +614,7 @@ FROM node@sha256:bbbb2222
 	}
 
 	analyzer := NewAnalyzer(WithOSVDisabled())
-	inventory, fs, err := analyzer.ScanArtifacts(artifacts)
+	inventory, fs, err := analyzer.ScanArtifacts(context.Background(), artifacts)
 	if err != nil {
 		t.Fatalf("ScanArtifacts returned error: %v", err)
 	}
@@ -656,7 +657,7 @@ services:
 	}
 
 	analyzer := NewAnalyzer(WithOSVDisabled())
-	inventory, _, err := analyzer.ScanArtifacts(artifacts)
+	inventory, _, err := analyzer.ScanArtifacts(context.Background(), artifacts)
 	if err != nil {
 		t.Fatalf("ScanArtifacts returned error: %v", err)
 	}
@@ -670,11 +671,11 @@ services:
 func TestScanArtifacts_MixedLockfileAndDockerfile(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	// Write a go.sum lockfile.
-	goSumContent := []byte("golang.org/x/text v0.3.7 h1:abc=\ngolang.org/x/text v0.3.7/go.mod h1:def=\n")
-	goSumPath := filepath.Join(tmpDir, "go.sum")
-	if err := os.WriteFile(goSumPath, goSumContent, 0o644); err != nil {
-		t.Fatalf("writing go.sum: %v", err)
+	// Write a go.mod lockfile (Go deps resolve from go.mod, not go.sum).
+	goModContent := []byte("module example.com/p\n\ngo 1.24\n\nrequire golang.org/x/text v0.3.7\n")
+	goModPath := filepath.Join(tmpDir, "go.mod")
+	if err := os.WriteFile(goModPath, goModContent, 0o644); err != nil {
+		t.Fatalf("writing go.mod: %v", err)
 	}
 
 	// Write a Dockerfile.
@@ -688,10 +689,10 @@ RUN go build -o app
 
 	artifacts := []discovery.Artifact{
 		{
-			Path:    "go.sum",
-			AbsPath: goSumPath,
+			Path:    "go.mod",
+			AbsPath: goModPath,
 			Type:    discovery.Lockfile,
-			Size:    int64(len(goSumContent)),
+			Size:    int64(len(goModContent)),
 		},
 		{
 			Path:    "Dockerfile",
@@ -702,7 +703,7 @@ RUN go build -o app
 	}
 
 	analyzer := NewAnalyzer(WithOSVDisabled())
-	inventory, _, err := analyzer.ScanArtifacts(artifacts)
+	inventory, _, err := analyzer.ScanArtifacts(context.Background(), artifacts)
 	if err != nil {
 		t.Fatalf("ScanArtifacts returned error: %v", err)
 	}
@@ -744,7 +745,7 @@ CMD ["python", "app.py"]
 	}
 
 	analyzer := NewAnalyzer(WithOSVDisabled())
-	inventory, _, err := analyzer.ScanArtifacts(artifacts)
+	inventory, _, err := analyzer.ScanArtifacts(context.Background(), artifacts)
 	if err != nil {
 		t.Fatalf("ScanArtifacts returned error: %v", err)
 	}
@@ -785,7 +786,7 @@ COPY --from=builder /app /app
 	}
 
 	analyzer := NewAnalyzer(WithOSVDisabled())
-	_, fs, err := analyzer.ScanArtifacts(artifacts)
+	_, fs, err := analyzer.ScanArtifacts(context.Background(), artifacts)
 	if err != nil {
 		t.Fatalf("ScanArtifacts returned error: %v", err)
 	}

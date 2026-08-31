@@ -7,17 +7,6 @@ before:
   hooks:
     - go mod tidy
     - go test ./...
-    # Pre-build the reachability plugin so the archive can ship it
-    # alongside the nox binary. The plugin lives in its own module;
-    # goreleaser's builds: stanza can't follow nested go.mod files
-    # directly, so a pre-hook produces the sibling artifact which the
-    # archive includes via files:. Output goes to top-level `bundled/`
-    # — recent GoReleaser asserts dist/ is empty after before-hooks
-    # run, so we cannot land artifacts there ahead of the build phase.
-    - mkdir -p bundled
-    # Strip the local `replace` directive and tidy so the plugin builds
-    # standalone in the release runner without the parent nox source tree.
-    - sh -c 'cd plugins/nox-plugin-reachability && sed -i.bak "/^replace /d" go.mod && rm -f go.mod.bak && go mod tidy && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o ../../bundled/nox-plugin-reachability .'
 
 builds:
   - id: nox
@@ -52,11 +41,6 @@ archives:
     files:
       - LICENSE
       - README.md
-      # Bundle the reachability plugin so vulnerable-dep call-graph
-      # analysis works out of the box without a separate plugin
-      # install. Built by the pre-hook above into bundled/.
-      - src: bundled/nox-plugin-reachability
-        dst: bin/nox-plugin-reachability
 
 checksum:
   name_template: 'checksums.txt'
@@ -123,7 +107,7 @@ brews:
     repository:
       owner: felixgeelhaar
       name: homebrew-tap
-      token: "{{ .Env.TAP_GITHUB_TOKEN }}" # nox:ignore SEC-163 -- Go template using env var
+      token: "{{ .Env.TAP_GITHUB_TOKEN }}"
     commit_author:
       name: goreleaserbot
       email: bot@goreleaser.com # nox:ignore DATA-001 -- goreleaser bot email
@@ -133,11 +117,14 @@ brews:
     license: "Apache-2.0"
     install: |
       bin.install "nox"
-      bin.install "bin/nox-plugin-reachability"
     test: |
       system "#{bin}/nox", "--help"
-      system "#{bin}/nox-plugin-reachability", "--help" rescue true
-    skip_upload: auto
+    # "auto" already skips prereleases/snapshots. SKIP_BREW additionally skips
+    # when the release workflow found TAP_GITHUB_TOKEN cannot reach the tap, so
+    # an expired packaging credential cannot fail the release and take cosign
+    # signing down with it. Defaults to "auto" for local/manual runs where the
+    # variable is unset.
+    skip_upload: '{{ if eq (envOrDefault "SKIP_BREW" "") "true" }}true{{ else }}auto{{ end }}'
 
 sboms:
   - artifacts: archive

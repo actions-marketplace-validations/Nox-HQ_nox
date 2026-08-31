@@ -45,6 +45,34 @@ func ValidTrack(t Track) bool {
 	return false
 }
 
+// Risk-class names, ordered from least to most privileged. They are the strings
+// stored in TrackCharacteristics.RiskClass and a plugin's declared class.
+const (
+	RiskClassPassive = "passive"
+	RiskClassActive  = "active"
+	RiskClassRuntime = "runtime"
+)
+
+// RiskClassLevel returns an ordinal for comparing risk classes: passive(0) <
+// active(1) < runtime(2). Anything else — including the EMPTY string and any
+// whitespace-padded or unknown value — returns -1, so it fails closed: an
+// admission check "declared <= max" can never pass for a class nox does not
+// recognise. This is the security posture both the plugin host and the SDK
+// conformance harness must share; a copy that mapped "" to passive(0) would let
+// an unclassified plugin be admitted under a passive ceiling.
+func RiskClassLevel(rc string) int {
+	switch rc {
+	case RiskClassPassive:
+		return 0
+	case RiskClassActive:
+		return 1
+	case RiskClassRuntime:
+		return 2
+	default:
+		return -1
+	}
+}
+
 // TrackCharacteristics describes the operational properties of a track.
 type TrackCharacteristics struct {
 	RiskClass string `json:"risk_class"` // "passive", "active", or "runtime"
@@ -103,6 +131,15 @@ type PluginEntry struct {
 	Maintainers []string `json:"maintainers,omitempty"`
 	License     string   `json:"license,omitempty"`
 	Repository  string   `json:"repository,omitempty"`
+
+	// Deprecated marks a plugin that is no longer maintained. Existing installs
+	// keep working — resolution and install are unaffected — but users are told,
+	// so a retired plugin cannot go on being adopted silently.
+	Deprecated bool `json:"deprecated,omitempty"`
+
+	// DeprecationNote explains what supersedes the plugin. It is shown verbatim
+	// on search, info and install, so it should name the replacement.
+	DeprecationNote string `json:"deprecation_note,omitempty"`
 }
 
 // VersionEntry describes a specific version of a plugin.

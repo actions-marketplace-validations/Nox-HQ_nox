@@ -1,0 +1,5 @@
+{
+  "schema": "nox-metamorphic-known-issues/v1",
+  "description": "Verified metamorphic violations that are pre-existing, separately-tracked nox defects. The corpus deliberately keeps the constructs that trip them so the oracle keeps watching (it will catch a NEW rule with the same shape, or a regression), but these specific (rule, seed, mutation) combinations do not fail the weekly sweep. Each entry must scope itself with non-empty ruleids AND seeds so a baseline can never blanket-suppress a class of future bugs. Remove an entry once the underlying rule is fixed; the sweep will then go green on its own and a re-introduction will fail.",
+  "known_issues": []
+}

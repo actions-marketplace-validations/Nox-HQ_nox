@@ -157,11 +157,19 @@ func buildPluginEntry(m *pluginManifest, version, repo, minNox string) registry.
 			Arch:   p.arch,
 			URL:    url,
 			Digest: "sha256:tbd",
-			// Cosign keyless signs checksums.txt. Both the legacy
-			// .sig and the v4-compatible .sig.bundle are published;
-			// nox prefers the bundle when available.
-			CosignSigURL:    fmt.Sprintf("%s/releases/download/v%s/checksums.txt.sig", repoURL, version),
-			CosignBundleURL: fmt.Sprintf("%s/releases/download/v%s/checksums.txt.sig.bundle", repoURL, version),
+			// Cosign keyless signs checksums.txt. The plugin release
+			// workflows run cosign v4, which writes a single
+			// checksums.txt.sigstore.json and NO detached .sig — the v3
+			// pair (.sig + .sig.bundle) is not published at all.
+			//
+			// Emitting the v3 names produced entries pointing at files that
+			// were never uploaded: the signature download 404s, the artifact
+			// is classified "unverified", and the install is blocked by the
+			// default trust policy. Every plugin version published after the
+			// move to cosign v4 was uninstallable until the index was
+			// repaired by hand. CosignSigURL is left empty (omitempty drops
+			// it) because v4 has nothing to put there.
+			CosignBundleURL: fmt.Sprintf("%s/releases/download/v%s/checksums.txt.sigstore.json", repoURL, version),
 			// Case-insensitive prefix: GitHub preserves the org's
 			// canonical case in OIDC certificate SANs (e.g. "Nox-HQ"),
 			// but the registry index conventionally lowercases owners.
@@ -244,12 +252,19 @@ func fetchHTTP(url string) ([]byte, error) {
 }
 
 // stdHTTPGet is a tiny wrapper so tests can override.
+//
+// the closure exists both so tests can substitute it and to carry the
+// gosec/noctx suppression below, which has nowhere to live on a bare reference.
+//
+//nolint:gocritic // unlambda: NOT replaceable with a bare http.Get reference —
 var stdHTTPGet = func(url string) (*http.Response, error) {
 	return http.Get(url) //nolint:gosec,noctx // checksum URL is operator-supplied; install path validates contents
 }
 
 // parseChecksumsFile parses a GoReleaser-style checksums.txt:
-//   <hex-sha256>  <filename>
+//
+//	<hex-sha256>  <filename>
+//
 // One line per artifact. Returns a map of filename -> hex digest.
 func parseChecksumsFile(body []byte) map[string]string {
 	out := map[string]string{}

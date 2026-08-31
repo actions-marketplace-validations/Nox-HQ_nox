@@ -9,9 +9,12 @@ package sarif
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"sort"
+	"strings"
 
+	"github.com/nox-hq/nox/core/compliance"
 	"github.com/nox-hq/nox/core/findings"
 	"github.com/nox-hq/nox/core/rules"
 )
@@ -71,7 +74,10 @@ type ReportingDescriptor struct {
 	Help                 *MultiformatMessage `json:"help,omitempty"`
 	HelpURI              string              `json:"helpUri,omitempty"`
 	DefaultConfiguration Configuration       `json:"defaultConfiguration"`
-	Properties           map[string]string   `json:"properties,omitempty"`
+	// Properties is a SARIF property bag. Values are typically strings (e.g.
+	// "cwe", "owasp-mcp") but "tags" is a []string so GitHub Code Scanning and
+	// registries can read rule categories from the standard taxonomy slot.
+	Properties map[string]any `json:"properties,omitempty"`
 }
 
 // MultiformatMessage is a SARIF message that can carry both plain text and
@@ -93,12 +99,20 @@ type Message struct {
 
 // Result is a single finding expressed in SARIF format.
 type Result struct {
-	RuleID       string            `json:"ruleId"`
-	RuleIndex    int               `json:"ruleIndex"`
-	Level        string            `json:"level"`
-	Message      Message           `json:"message"`
-	Locations    []Location        `json:"locations"`
+	RuleID    string  `json:"ruleId"`
+	RuleIndex int     `json:"ruleIndex"`
+	Level     string  `json:"level"`
+	Message   Message `json:"message"`
+	// omitempty matters: a nil slice would serialise as `"locations": null`,
+	// which is no more acceptable to a consumer than an empty uri. A
+	// location-less result must have no locations KEY at all.
+	Locations    []Location        `json:"locations,omitempty"`
 	Fingerprints map[string]string `json:"fingerprints"`
+	// Properties carries the finding's Metadata — the reachability class, the
+	// vuln class, and the original-severity downgrade audit trail. Without it a
+	// finding downgraded from critical to low showed only "low" in SARIF with
+	// no record of the override. Omitted when the finding has no metadata.
+	Properties map[string]any `json:"properties,omitempty"`
 }
 
 // Location wraps a physical location within a source artifact.
@@ -109,7 +123,10 @@ type Location struct {
 // PhysicalLocation identifies a file and region within that file.
 type PhysicalLocation struct {
 	ArtifactLocation ArtifactLocation `json:"artifactLocation"`
-	Region           Region           `json:"region"`
+	// Region is a pointer so a file-level finding (no line) omits it. An empty
+	// "region": {} object is rejected by strict SARIF validators, which require
+	// a region to carry at least one property.
+	Region *Region `json:"region,omitempty"`
 }
 
 // ArtifactLocation is a URI reference to a source file.
@@ -171,27 +188,50 @@ func (r *Reporter) Generate(fs *findings.FindingSet) ([]byte, error) {
 			idx = 0
 		}
 
+		// A finding with no file is reported WITHOUT a location, never with an
+		// empty one.
+		//
+		// Some verdicts are about the dependency graph rather than a line of
+		// source — a reachability class, or a repository-scoped "no private
+		// registry configured" — and arrive with an empty path. Writing that
+		// through produced `"uri": ""`, and GitHub rejects the SUBMISSION for
+		// it, not the offending result:
+		//
+		//	locationFromSarifResult: expected artifact location
+		//
+		// So one location-less finding from one plugin cost a repository its
+		// entire code-scanning upload, while the same scan looked clean
+		// locally. Any analyzer can emit this shape, so the containment
+		// belongs here rather than in each of them.
+		//
+		// The result is kept: SARIF permits a result with no locations, and
+		// dropping it would trade a broken upload for a silently missing
+		// verdict — the worse failure for a security tool. An absent array
+		// cannot trip "expected artifact location"; an empty-uri entry does.
+		var locations []Location
+		if f.Location.FilePath != "" {
+			phys := PhysicalLocation{
+				ArtifactLocation: ArtifactLocation{URI: encodeURI(f.Location.FilePath)},
+			}
+			if f.Location.StartLine > 0 {
+				phys.Region = &Region{
+					StartLine:   f.Location.StartLine,
+					StartColumn: f.Location.StartColumn,
+					EndLine:     f.Location.EndLine,
+					EndColumn:   f.Location.EndColumn,
+				}
+			}
+			locations = []Location{{PhysicalLocation: phys}}
+		}
+
 		result := Result{
-			RuleID:    f.RuleID,
-			RuleIndex: idx,
-			Level:     severityToLevel(f.Severity),
-			Message:   Message{Text: f.Message},
-			Locations: []Location{
-				{
-					PhysicalLocation: PhysicalLocation{
-						ArtifactLocation: ArtifactLocation{URI: f.Location.FilePath},
-						Region: Region{
-							StartLine:   f.Location.StartLine,
-							StartColumn: f.Location.StartColumn,
-							EndLine:     f.Location.EndLine,
-							EndColumn:   f.Location.EndColumn,
-						},
-					},
-				},
-			},
-			Fingerprints: map[string]string{
-				"nox/v1": f.Fingerprint,
-			},
+			RuleID:       f.RuleID,
+			RuleIndex:    idx,
+			Level:        severityToLevel(f.Severity),
+			Message:      Message{Text: f.Message},
+			Locations:    locations,
+			Fingerprints: map[string]string{"nox/v1": f.Fingerprint},
+			Properties:   sarifProperties(f),
 		}
 		results = append(results, result)
 	}
@@ -234,6 +274,31 @@ func (r *Reporter) WriteToFile(fs *findings.FindingSet, path string) error {
 // severityToLevel maps a Nox severity to the corresponding SARIF level
 // string. Critical and high map to "error", medium to "warning", and low/info
 // to "note".
+// securitySeverity maps a nox severity to the SARIF `security-severity`
+// property GitHub Code Scanning reads. SARIF `level` alone only distinguishes
+// error/warning/note, so without this every nox alert arrived with no security
+// severity at all: the Code Scanning UI could not filter or sort by severity,
+// and severity-based alert rules had nothing to match on.
+//
+// The value is a CVSS-style score string, banded the way GitHub interprets it:
+// >= 9.0 critical, 7.0-8.9 high, 4.0-6.9 medium, < 4.0 low. Info is not a
+// security severity and is deliberately omitted (empty) rather than scored 0,
+// which would render as "low" and overstate it.
+func securitySeverity(s findings.Severity) string {
+	switch s {
+	case findings.SeverityCritical:
+		return "9.5"
+	case findings.SeverityHigh:
+		return "8.0"
+	case findings.SeverityMedium:
+		return "5.5"
+	case findings.SeverityLow:
+		return "2.0"
+	default:
+		return ""
+	}
+}
+
 func severityToLevel(s findings.Severity) string {
 	switch s {
 	case findings.SeverityCritical, findings.SeverityHigh:
@@ -251,11 +316,63 @@ func severityToLevel(s findings.Severity) string {
 // its index within that array. When the reporter has a RuleSet, the catalog is
 // populated from it. Otherwise the catalog is derived from the unique rule IDs
 // found in the given findings slice.
+// encodeURI turns a scanned file path into a valid SARIF artifact URI. Paths
+// may contain spaces, '#', '?' and other characters that are invalid in a raw
+// URI reference; a bare '#' in particular truncates the path at the fragment.
+// Backslashes from Windows runners are normalised to forward slashes first so
+// the result is a portable relative URI.
+func encodeURI(path string) string {
+	path = strings.ReplaceAll(path, "\\", "/")
+	u := url.URL{Path: path}
+	return u.String()
+}
+
+// sarifProperties projects a finding's metadata into a SARIF property bag,
+// returning nil when there is nothing to carry so the field is omitted.
+func sarifProperties(f findings.Finding) map[string]any {
+	if len(f.Metadata) == 0 {
+		return nil
+	}
+	props := make(map[string]any, len(f.Metadata))
+	for k, v := range f.Metadata {
+		props[k] = v
+	}
+	return props
+}
+
 func (r *Reporter) buildRuleCatalog(items []findings.Finding) (catalog []ReportingDescriptor, index map[string]int) {
 	if r.Rules != nil {
-		return r.buildCatalogFromRuleSet()
+		catalog, index = r.buildCatalogFromRuleSet()
+	} else {
+		return r.buildCatalogFromFindings(items)
 	}
-	return r.buildCatalogFromFindings(items)
+
+	// Reconcile against the findings actually present. A finding whose rule is
+	// not in the RuleSet — every plugin finding (taint, reachability) and any
+	// analyzer rule missing from the catalog — would otherwise get RuleIndex 0,
+	// a dangling ruleId pointing at whatever rule sorts first. GitHub Code
+	// Scanning validates this and rejects the whole upload silently. Synthesise
+	// a minimal descriptor for each missing rule ID so the reference resolves.
+	for i := range items {
+		id := items[i].RuleID
+		if _, ok := index[id]; ok || id == "" {
+			continue
+		}
+		index[id] = len(catalog)
+		desc := ReportingDescriptor{
+			ID:               id,
+			Name:             id,
+			ShortDescription: Message{Text: items[i].Message},
+			DefaultConfiguration: Configuration{
+				Level: severityToLevel(items[i].Severity),
+			},
+		}
+		if ss := securitySeverity(items[i].Severity); ss != "" {
+			desc.Properties = map[string]any{"security-severity": ss}
+		}
+		catalog = append(catalog, desc)
+	}
+	return catalog, index
 }
 
 // buildCatalogFromRuleSet creates catalog entries for every rule in the
@@ -288,8 +405,24 @@ func (r *Reporter) buildCatalogFromRuleSet() (catalog []ReportingDescriptor, ind
 			},
 		}
 
-		if len(rule.Metadata) > 0 {
-			desc.Properties = rule.Metadata
+		props := make(map[string]any, len(rule.Metadata)+2)
+		for k, v := range rule.Metadata {
+			props[k] = v
+		}
+		// Surface OWASP MCP Top 10 control mapping for standards alignment.
+		if control := compliance.ControlForRule(rule.ID, rule.Tags); control != "" {
+			props["owasp-mcp"] = control
+		}
+		// Emit rule tags in the standard SARIF taxonomy slot.
+		if len(rule.Tags) > 0 {
+			props["tags"] = rule.Tags
+		}
+		// GitHub Code Scanning classifies alerts by this, not by SARIF level.
+		if ss := securitySeverity(rule.Severity); ss != "" {
+			props["security-severity"] = ss
+		}
+		if len(props) > 0 {
+			desc.Properties = props
 		}
 
 		// Populate help text from Remediation for GitHub Code Scanning.
@@ -359,7 +492,7 @@ func (r *Reporter) buildCatalogFromFindings(items []findings.Finding) (catalog [
 	for _, ri := range unique {
 		idx := len(catalog)
 		index[ri.id] = idx
-		catalog = append(catalog, ReportingDescriptor{
+		desc := ReportingDescriptor{
 			ID:   ri.id,
 			Name: ri.id,
 			ShortDescription: Message{
@@ -368,7 +501,11 @@ func (r *Reporter) buildCatalogFromFindings(items []findings.Finding) (catalog [
 			DefaultConfiguration: Configuration{
 				Level: severityToLevel(ri.severity),
 			},
-		})
+		}
+		if ss := securitySeverity(ri.severity); ss != "" {
+			desc.Properties = map[string]any{"security-severity": ss}
+		}
+		catalog = append(catalog, desc)
 	}
 
 	return catalog, index

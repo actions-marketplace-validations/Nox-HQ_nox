@@ -184,6 +184,47 @@ func TestEntropyMatcher_ColonAssignment(t *testing.T) {
 	}
 }
 
+// A struct-literal field in Go/Rust/Swift uses the same `name: value` shape as
+// YAML, so the colon tokenizer picks up the field's expression as if it were a
+// value. `domain.PrePush.ConfigKey` is a selector expression with no value at
+// scan time — but it is 24 chars of mixed case with dots (so the camelCase
+// guard, which rejects non-alphanumerics, does not catch it) and its entropy is
+// 4.085, over SEC-163's context-boosted 4.0. It was reported as a "high-entropy
+// hex string" despite containing no hex, and because such findings surface as
+// code-scanning review comments it blocked a PR from merging.
+func TestEntropyMatcher_SkipsMethodCallInStructLiteral(t *testing.T) {
+	m := &EntropyMatcher{}
+	rule := Rule{MatcherType: "entropy", Metadata: map[string]string{
+		"entropy_threshold": "4.5", "require_context": "true",
+	}}
+
+	for _, line := range []string{
+		"\t\tHook:          domain.PrePush.ConfigKey(),",
+		"\t\tToken: config.Provider.SecretToken(),",
+		"\t\tkey: obj.Nested.CredentialLookup(),",
+	} {
+		if results := m.Match([]byte(line+"\n"), &rule); len(results) != 0 {
+			t.Errorf("flagged a method call as a secret in %q: %+v", strings.TrimSpace(line), results)
+		}
+	}
+}
+
+// The paren guard must not cost recall: a real secret is never followed by '('.
+func TestEntropyMatcher_CallGuardKeepsRealSecrets(t *testing.T) {
+	m := &EntropyMatcher{}
+	rule := Rule{MatcherType: "entropy"}
+
+	for _, line := range []string{
+		"api_key: aK3jR8mZ2pL5nW9xQ4vB7yD1sF6hT0c",          // colon, unquoted
+		"api_key = aK3jR8mZ2pL5nW9xQ4vB7yD1sF6hT0c",         // equals, unquoted
+		"secret: aK3jR8mZ2pL5nW9xQ4vB7yD1sF6hT0c(notacall)", // paren later, not adjacent
+	} {
+		if results := m.Match([]byte(line+"\n"), &rule); len(results) == 0 {
+			t.Errorf("lost a real secret in %q", line)
+		}
+	}
+}
+
 func TestEntropyMatcher_FatArrowAssignment(t *testing.T) {
 	m := &EntropyMatcher{}
 
@@ -222,6 +263,47 @@ func TestEntropyMatcher_Base64Blob(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("expected to find the base64 blob in match results")
+	}
+}
+
+// TestEntropyMatcher_SkipsSRIIntegrityHash verifies that a Subresource
+// Integrity (SRI) hash — a public, base64-encoded content digest prefixed by
+// its algorithm (sha256-/sha384-/sha512-) — does not fire the entropy rules.
+// SRI hashes are integrity values embedded in HTML/JSX/struct tags, not
+// credentials; flagging them is the same false-positive class as lockfile
+// hashes and git SHAs (precision-suite clean_identifiers.go).
+func TestEntropyMatcher_SkipsSRIIntegrityHash(t *testing.T) {
+	m := &EntropyMatcher{}
+	// The base64 body carries a '+' and '/', high entropy, and secret-context
+	// keyword "integrity" on the line — exactly the shape that used to fire.
+	content := []byte("\tIntegrity string // sha384-oqVuAfXRKap7fdgcCY5uykM6+R9GqQ8K/uxy9rx7HNQlGYl1kPzQho1wx4JwY8w\n")
+	rule := Rule{MatcherType: "entropy", Metadata: map[string]string{"entropy_threshold": "5.0"}}
+
+	if results := m.Match(content, &rule); len(results) != 0 {
+		t.Fatalf("expected no matches for SRI integrity hash, got %d: %+v", len(results), results)
+	}
+}
+
+// TestIsSRIIntegrityHashLine covers the SRI-prefix recognition helper directly.
+func TestIsSRIIntegrityHashLine(t *testing.T) {
+	tests := []struct {
+		name string
+		line string
+		col  int // 1-based column of the candidate within line
+		want bool
+	}{
+		{"sha384", "x = sha384-oqVuAfXRKap7fdgcCY5uykM6", 12, true},
+		{"sha256", "integrity=\"sha256-AbCdEf0123456789+/xyz\"", 19, true},
+		{"sha512", "  sha512-ZZZ0123456789abcdefGHIJ", 10, true},
+		{"no-prefix", "key = oqVuAfXRKap7fdgcCY5uykM6", 7, false},
+		{"unrelated-word", "mysha384-oqVuAfXRKap7fdgcCY5", 10, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isSRIIntegrityHash(tt.line, tt.col); got != tt.want {
+				t.Fatalf("isSRIIntegrityHash(%q, %d) = %v, want %v", tt.line, tt.col, got, tt.want)
+			}
+		})
 	}
 }
 
@@ -561,6 +643,18 @@ func TestIsLikelyNotSecret(t *testing.T) {
 		{"PascalCase identifier", "CalculateTotalAmount", true},
 		{"mostly digits", "12345678901234567890", true},
 		{"all uppercase", "PRODUCTION", true},
+		// SCREAMING_SNAKE_CASE constant names — never credentials.
+		{"screaming snake case", "DEFAULT_RUN_CONTEXT_THREAD_ID_KEY", true},
+		{"screaming snake with digits", "MAX_RETRY_COUNT_3", true},
+		// snake_case attribute access chains — never credentials.
+		{"snake case attr chain", "resolved_options.run_context_thread_id_key", true},
+		{"simple snake case var", "run_context_thread_id", true},
+		// Template expressions (f-strings, shell substitution) — never raw credentials.
+		{"fstring template braces", "{DEFAULT_RUN_CONTEXT_THREAD_ID_KEY}_{suffix}", true},
+		{"shell var substitution", "${MY_SECRET_TOKEN}_value", true},
+		// Real secret tokens must still be detected.
+		{"random token no underscore", "aK3jR8mZ2pL5nW9xQ7vB", false},
+		{"hex-like mixed", "a1B2c3D4e5F6g7H8i9J0", false},
 	}
 
 	for _, tt := range tests {
@@ -766,6 +860,78 @@ func TestIsMostlyDigits(t *testing.T) {
 	}
 }
 
+func TestIsScreamingSnakeCase(t *testing.T) {
+	tests := []struct {
+		s    string
+		want bool
+	}{
+		{"DEFAULT_RUN_CONTEXT_THREAD_ID_KEY", true},
+		{"MAX_RETRY_COUNT", true},
+		{"MAX_RETRY_COUNT_3", true},
+		{"PRODUCTION", false}, // no underscore
+		{"my_const", false},   // lowercase
+		{"MixedCase", false},  // has lowercase
+		{"A_B", false},        // too short (< 4 chars)
+		{"AB_CD", true},
+		{"", false},
+		{"AB", false}, // too short, no underscore
+	}
+	for _, tt := range tests {
+		t.Run(tt.s, func(t *testing.T) {
+			if got := isScreamingSnakeCase(tt.s); got != tt.want {
+				t.Fatalf("isScreamingSnakeCase(%q) = %v, want %v", tt.s, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsLowercaseDotChain(t *testing.T) {
+	tests := []struct {
+		s    string
+		want bool
+	}{
+		{"resolved_options.run_context_thread_id_key", true},
+		{"run_context_thread_id", true},
+		{"some.module.method_name", true},
+		{"MixedCase_something", false}, // has uppercase
+		{"no_dot_and_under", true},     // underscore present, no dot — still matches
+		{"plainword", false},           // no underscore
+		{"SCREAMING_SNAKE", false},     // uppercase
+		{"has+special", false},         // has +
+		{"", false},
+		{"a_b", false}, // too short (< 4 chars; never a candidate anyway)
+		{"some_var", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.s, func(t *testing.T) {
+			if got := isLowercaseDotChain(tt.s); got != tt.want {
+				t.Fatalf("isLowercaseDotChain(%q) = %v, want %v", tt.s, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestContainsTemplateBraces(t *testing.T) {
+	tests := []struct {
+		s    string
+		want bool
+	}{
+		{"{DEFAULT_RUN_CONTEXT_THREAD_ID_KEY}_{suffix}", true},
+		{"${MY_SECRET_TOKEN}", true},
+		{"no braces here", false},
+		{"{only open", false},
+		{"only close}", false},
+		{"", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.s, func(t *testing.T) {
+			if got := containsTemplateBraces(tt.s); got != tt.want {
+				t.Fatalf("containsTemplateBraces(%q) = %v, want %v", tt.s, got, tt.want)
+			}
+		})
+	}
+}
+
 // ---------------------------------------------------------------------------
 // EntropyMatcher: false positive regression tests for common patterns
 // ---------------------------------------------------------------------------
@@ -801,6 +967,23 @@ func TestEntropyMatcher_FalsePositiveRegression(t *testing.T) {
 		{
 			name:    "SHA-256 checksum",
 			content: `sha256: abc123def456abc123def456abc123def456abc123def456abc123def456abc1`,
+		},
+		// Regression: openai-agents-python SEC-163 false positives (scan-of-week 2026-08-01)
+		{
+			name:    "SCREAMING_SNAKE constant in fstring template",
+			content: `        return f"{DEFAULT_RUN_CONTEXT_THREAD_ID_KEY}_{suffix}"`,
+		},
+		{
+			name:    "snake_case attribute access as kwarg value",
+			content: `        configured_key=resolved_options.run_context_thread_id_key,`,
+		},
+		{
+			name:    "PascalCase method call as assignment RHS",
+			content: `        approval_key = RunContextWrapper._resolve_approval_key(interruption)`,
+		},
+		{
+			name:    "PascalCase.from_state call as assignment RHS",
+			content: `        inner = BlaxelSandboxSession.from_state(state, sandbox=blaxel_sandbox, token=self._token)`,
 		},
 	}
 
@@ -1007,5 +1190,32 @@ func TestIsTokenChar(t *testing.T) {
 				t.Fatalf("isTokenChar(%q) = %v, want %v", tt.ch, got, tt.want)
 			}
 		})
+	}
+}
+
+// Regression for #104: the generic entropy detectors must not flag
+// natural-language prose, SQL, or format-string literals — they have high
+// aggregate entropy but internal whitespace, and are not credentials. A
+// compact secret token (no whitespace) must still be detected.
+func TestEntropyMatcher_IgnoresProse(t *testing.T) {
+	m := &EntropyMatcher{}
+	rule := Rule{MatcherType: "entropy"}
+
+	prose := []string{
+		`msg := "Risk: the finding shows the 72-hour deadline may be missed (GDPR-Art-33)."`,
+		`return "the key contractual provisions obligation (DORA-Art-30)."`,
+		`pool.Exec(ctx, "ALTER ROLE lexora_app LOGIN PASSWORD 'app_pw'")`,
+		`tmpl := "judgement was not the required JSON object {judgements: [{citation, bucket}]}"`,
+	}
+	for _, line := range prose {
+		if got := m.Match([]byte(line), &rule); len(got) != 0 {
+			t.Errorf("prose flagged as secret: %q -> %+v", line, got)
+		}
+	}
+
+	// A real compact secret (no whitespace) is still caught.
+	secret := []byte(`api_key = "aK3jR8mZ2pL5nW9xQ4vB7yD1sF6hT0c"`)
+	if got := m.Match(secret, &rule); len(got) == 0 {
+		t.Error("a real whitespace-free high-entropy secret must still be detected")
 	}
 }

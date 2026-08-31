@@ -9,9 +9,9 @@ import (
 	"html/template"
 	"os"
 	"sort"
-	"time"
 
 	"github.com/nox-hq/nox/core/findings"
+	"github.com/nox-hq/nox/core/report"
 )
 
 // Reporter generates standalone HTML reports from scan findings.
@@ -119,7 +119,10 @@ func (r *Reporter) Generate(fs *findings.FindingSet) ([]byte, error) {
 
 	data := reportData{
 		ToolVersion: r.ToolVersion,
-		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
+		// Use report.GeneratedAt() so the embedded timestamp honors
+		// SOURCE_DATE_EPOCH like the JSON and SBOM emitters, keeping the HTML
+		// artifact byte-reproducible across runs.
+		GeneratedAt: report.GeneratedAt(),
 		Counts:      counts,
 		Findings:    rows,
 		SevPercents: percents,
@@ -165,16 +168,7 @@ func sevClass(s findings.Severity) string {
 }
 
 func sevRank(s string) int {
-	switch s {
-	case "critical":
-		return 0
-	case "high":
-		return 1
-	case "medium":
-		return 2
-	case "low":
-		return 3
-	default:
-		return 4
-	}
+	// Delegates to the one canonical ranking so the report sorts severities the
+	// same way the policy gate compares them.
+	return findings.SeverityRank(findings.Severity(s))
 }

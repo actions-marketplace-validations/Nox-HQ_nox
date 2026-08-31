@@ -6,6 +6,7 @@
 package data
 
 import (
+	"context"
 	"fmt"
 	"os"
 
@@ -45,10 +46,16 @@ func (a *Analyzer) ScanFile(path string, content []byte) ([]findings.Finding, er
 // ScanArtifacts reads each artifact file from disk, scans it for sensitive
 // data patterns, and collects all findings into a deduplicated FindingSet. If
 // any artifact cannot be read, scanning stops and the error is returned.
-func (a *Analyzer) ScanArtifacts(artifacts []discovery.Artifact) (*findings.FindingSet, error) {
+func (a *Analyzer) ScanArtifacts(ctx context.Context, artifacts []discovery.Artifact) (*findings.FindingSet, error) {
 	fs := findings.NewFindingSet()
 
 	for _, artifact := range artifacts {
+		// Honour cancellation between artifacts — see the note in the secrets
+		// analyzer: nothing else in this loop consults ctx.
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
 		content, err := os.ReadFile(artifact.AbsPath)
 		if err != nil {
 			return nil, fmt.Errorf("reading artifact %s: %w", artifact.Path, err)

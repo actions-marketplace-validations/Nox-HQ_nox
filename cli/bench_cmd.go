@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -38,6 +39,15 @@ var curatedAutoCorpus = []struct {
 // set into a temp directory and runs the same harness against it —
 // reproducible numbers without manual setup.
 func runBench(args []string) int {
+	// `nox bench --precision <corpus>` is a distinct mode: instead of
+	// fire-rates over many projects, it scores one labeled corpus for
+	// precision/recall/F1 against inline `nox-expect` ground truth. It is
+	// routed early so it can own its own flag set without colliding with the
+	// fire-rate flags (e.g. --min-precision, --json).
+	if hasFlag(args, "precision") {
+		return runBenchPrecision(args)
+	}
+
 	fs := flag.NewFlagSet("bench", flag.ContinueOnError)
 	var (
 		corpusDir  string
@@ -132,12 +142,12 @@ func runBench(args []string) int {
 // BenchReport is the top-level bench output. Stable JSON shape so
 // downstream tooling can join across runs.
 type BenchReport struct {
-	StartedAt   string           `json:"started_at"`
-	FinishedAt  string           `json:"finished_at"`
-	NoxBinary   string           `json:"nox_binary"`
-	Projects    []ProjectSummary `json:"projects"`
-	Failed      []FailedProject  `json:"failed,omitempty"`
-	RuleFireRate map[string]int  `json:"rule_fire_rate,omitempty"`
+	StartedAt    string           `json:"started_at"`
+	FinishedAt   string           `json:"finished_at"`
+	NoxBinary    string           `json:"nox_binary"`
+	Projects     []ProjectSummary `json:"projects"`
+	Failed       []FailedProject  `json:"failed,omitempty"`
+	RuleFireRate map[string]int   `json:"rule_fire_rate,omitempty"`
 }
 
 type ProjectSummary struct {
@@ -166,9 +176,8 @@ func scanProject(noxPath, project string) (ProjectSummary, error) {
 	if err := cmd.Run(); err != nil {
 		// nox returns 1 on findings — treat that as success here. We
 		// only care about scan errors.
-		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
-			// fall through
-		} else {
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
 			return ProjectSummary{}, err
 		}
 	}

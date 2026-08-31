@@ -5,44 +5,15 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/nox-hq/nox/core/catalog"
+
 	"github.com/nox-hq/nox/core/findings"
 )
 
 // familyOf maps a rule ID to a human-readable family label. Operators
 // see family labels rather than 11 distinct rule-ID prefixes; the
 // prefixes themselves stay stable for tooling that joins on RuleID.
-func familyOf(ruleID string) string {
-	switch {
-	case strings.HasPrefix(ruleID, "SEC-"):
-		return "Secrets"
-	case strings.HasPrefix(ruleID, "DATA-"):
-		return "Privacy / PII"
-	case strings.HasPrefix(ruleID, "IAC-"):
-		return "Infrastructure"
-	case strings.HasPrefix(ruleID, "CONT-"):
-		return "Container"
-	case strings.HasPrefix(ruleID, "VULN-"):
-		return "Dependencies"
-	case strings.HasPrefix(ruleID, "LIC-"):
-		return "License"
-	case strings.HasPrefix(ruleID, "MCP-"):
-		return "MCP Hardening"
-	case strings.HasPrefix(ruleID, "AI-PI-"):
-		return "AI / Prompt Injection (LLM01)"
-	case strings.HasPrefix(ruleID, "AI-EMBED-"):
-		return "AI / Embedding Leakage (LLM06)"
-	case strings.HasPrefix(ruleID, "AI-AGENT-"):
-		return "AI / Agent Lattice (LLM07)"
-	case strings.HasPrefix(ruleID, "AI-"):
-		return "AI Security"
-	case strings.HasPrefix(ruleID, "REACH-"):
-		return "Reachability"
-	case strings.HasPrefix(ruleID, "TAINT-"):
-		return "Taint Flow"
-	default:
-		return "Other"
-	}
-}
+func familyOf(ruleID string) string { return catalog.Family(ruleID).Label }
 
 // familySummary returns a one-line "Secrets:23, Infrastructure:12, ..." // nox:ignore SEC-163 -- code comment
 // breakdown of active findings sorted by descending count. Returns "" on

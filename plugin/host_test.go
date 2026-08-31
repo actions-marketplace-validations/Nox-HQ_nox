@@ -263,7 +263,7 @@ func TestHost_MergeResults_Findings(t *testing.T) {
 		},
 	}
 
-	h.MergeResults(resp, result)
+	h.MergeResults("test-plugin", resp, result, "")
 
 	ff := result.Findings.Findings()
 	if len(ff) != 1 {
@@ -295,7 +295,7 @@ func TestHost_MergeResults_Packages(t *testing.T) {
 		},
 	}
 
-	h.MergeResults(resp, result)
+	h.MergeResults("test-plugin", resp, result, "")
 
 	pkgs := result.Inventory.Packages()
 	if len(pkgs) != 2 {
@@ -320,7 +320,7 @@ func TestHost_MergeResults_AIComponents(t *testing.T) {
 		},
 	}
 
-	h.MergeResults(resp, result)
+	h.MergeResults("test-plugin", resp, result, "")
 
 	if len(result.AIInventory.Components) != 1 {
 		t.Fatalf("len(Components) = %d, want 1", len(result.AIInventory.Components))
@@ -338,7 +338,7 @@ func TestHost_MergeResults_EmptyResponse(t *testing.T) {
 		AIInventory: ai.NewInventory(),
 	}
 
-	h.MergeResults(&pluginv1.InvokeToolResponse{}, result)
+	h.MergeResults("test-plugin", &pluginv1.InvokeToolResponse{}, result, "")
 
 	if len(result.Findings.Findings()) != 0 {
 		t.Error("empty response should not add findings")
@@ -360,8 +360,8 @@ func TestHost_MergeResults_Nil(t *testing.T) {
 	}
 
 	// Should not panic.
-	h.MergeResults(nil, result)
-	h.MergeResults(&pluginv1.InvokeToolResponse{}, nil)
+	h.MergeResults("test-plugin", nil, result, "")
+	h.MergeResults("test-plugin", &pluginv1.InvokeToolResponse{}, nil, "")
 }
 
 func TestHost_MergeAllResults(t *testing.T) {
@@ -388,7 +388,7 @@ func TestHost_MergeAllResults(t *testing.T) {
 		},
 	}
 
-	h.MergeAllResults(responses, result)
+	h.MergeAllResults(attributed(responses), result, "")
 
 	if len(result.Findings.Findings()) != 2 {
 		t.Errorf("len(Findings) = %d, want 2", len(result.Findings.Findings()))
@@ -918,7 +918,7 @@ func TestHost_MergeResults_Graphs(t *testing.T) {
 		},
 	}
 
-	h.MergeResults(resp, result)
+	h.MergeResults("test-plugin", resp, result, "")
 
 	if len(result.Graphs) != 1 {
 		t.Fatalf("expected 1 graph, got %d", len(result.Graphs))
@@ -955,7 +955,7 @@ func TestHost_MergeResults_Enrichments(t *testing.T) {
 		},
 	}
 
-	h.MergeResults(resp, result)
+	h.MergeResults("test-plugin", resp, result, "")
 
 	if len(result.Enrichments) != 1 {
 		t.Fatalf("expected 1 enrichment, got %d", len(result.Enrichments))
@@ -980,7 +980,7 @@ func TestHost_MergeResults_GraphsAndEnrichments_Empty(t *testing.T) {
 		AIInventory: ai.NewInventory(),
 	}
 
-	h.MergeResults(&pluginv1.InvokeToolResponse{}, result)
+	h.MergeResults("test-plugin", &pluginv1.InvokeToolResponse{}, result, "")
 
 	if len(result.Graphs) != 0 {
 		t.Error("empty response should not add graphs")
@@ -1227,7 +1227,7 @@ func TestHost_MergeAllResults_WithGraphsAndEnrichments(t *testing.T) {
 		},
 	}
 
-	h.MergeAllResults(responses, result)
+	h.MergeAllResults(attributed(responses), result, "")
 
 	if len(result.Graphs) != 2 {
 		t.Errorf("expected 2 graphs, got %d", len(result.Graphs))
@@ -1235,4 +1235,356 @@ func TestHost_MergeAllResults_WithGraphsAndEnrichments(t *testing.T) {
 	if len(result.Enrichments) != 1 {
 		t.Errorf("expected 1 enrichment, got %d", len(result.Enrichments))
 	}
+}
+
+// attributed wraps bare responses for tests written before InvokeAll began
+// carrying the producing plugin's name alongside each response.
+func attributed(responses []*pluginv1.InvokeToolResponse) []AttributedResponse {
+	out := make([]AttributedResponse, 0, len(responses))
+	for _, r := range responses {
+		out = append(out, AttributedResponse{PluginName: "test-plugin", Response: r})
+	}
+	return out
+}
+
+// TestHost_MergeResults_PluginCannotSuppressCoreFinding reproduces the attack
+// end to end: a plugin claims a core finding's fingerprint, hoping Deduplicate
+// (first-wins) will drop the core finding in favour of its own. Before
+// fingerprints were recomputed host-side this erased the core finding
+// outright — the scan reported the plugin's benign entry and nothing else.
+func TestHost_MergeResults_PluginCannotSuppressCoreFinding(t *testing.T) {
+	h := NewHost()
+	result := &core.ScanResult{
+		Findings:    findings.NewFindingSet(),
+		Inventory:   &deps.PackageInventory{},
+		AIInventory: ai.NewInventory(),
+	}
+
+	coreFinding := findings.Finding{
+		RuleID:   "SEC-001",
+		Severity: findings.SeverityCritical,
+		Message:  "Hardcoded AWS key",
+		Location: findings.Location{FilePath: "app/config.go", StartLine: 12},
+	}
+	result.Findings.Add(coreFinding)
+
+	stored := result.Findings.Findings()[0].Fingerprint
+	if stored == "" {
+		t.Fatal("expected the core finding to have a fingerprint")
+	}
+
+	// The plugin claims the core finding's fingerprint verbatim.
+	h.MergeResults("evil-plugin", &pluginv1.InvokeToolResponse{
+		Findings: []*pluginv1.Finding{{
+			RuleId:      "PLG-001",
+			Severity:    pluginv1.Severity_SEVERITY_INFO,
+			Message:     "nothing to see here",
+			Fingerprint: stored,
+			Location:    &pluginv1.Location{FilePath: "app/config.go", StartLine: 12},
+		}},
+	}, result, "")
+
+	result.Findings.Deduplicate()
+
+	items := result.Findings.Findings()
+	if len(items) != 2 {
+		t.Fatalf("expected both findings to survive dedup, got %d", len(items))
+	}
+
+	var foundCore bool
+	for _, f := range items {
+		if f.RuleID == "SEC-001" && f.Severity == findings.SeverityCritical {
+			foundCore = true
+		}
+	}
+	if !foundCore {
+		t.Error("the core critical finding was suppressed by the plugin's claimed fingerprint")
+	}
+}
+
+// TestHost_InvokePostScan_EnforcesReadOnlyGate is the regression test for a
+// bypass of nox's core safety promise.
+//
+// InvokePostScan called the gRPC client directly, applying no policy at all, so
+// a plugin declaring a non-read-only tool with requires_scan_context ran it
+// regardless of the passive default. nox/remediate ships exactly that shape —
+// apply_code, which modifies source — meaning "nox never auto-applies fixes"
+// was bypassable by a registry plugin.
+//
+// This asserts the outcome that matters: the tool does not execute.
+func TestHost_InvokePostScan_EnforcesReadOnlyGate(t *testing.T) {
+	var invoked bool
+
+	mock := &mockPluginServer{
+		manifest: &pluginv1.GetManifestResponse{
+			Name:       "mutating-plugin",
+			Version:    "1.0.0",
+			ApiVersion: HostAPIVersion,
+			Capabilities: []*pluginv1.Capability{{
+				Name: "remediation",
+				Tools: []*pluginv1.ToolDef{{
+					Name:                "apply_code",
+					Description:         "Rewrites source files",
+					ReadOnly:            false,
+					RequiresScanContext: true,
+				}},
+			}},
+		},
+		invokeFunc: func(_ context.Context, _ *pluginv1.InvokeToolRequest) (*pluginv1.InvokeToolResponse, error) {
+			invoked = true
+			return &pluginv1.InvokeToolResponse{}, nil
+		},
+	}
+
+	conn := startMockPlugin(t, mock)
+	// DefaultPolicy is passive, which is what an operator gets without opting in.
+	h := newTestHost()
+	if err := h.RegisterPlugin(context.Background(), conn); err != nil {
+		t.Fatalf("RegisterPlugin: %v", err)
+	}
+
+	result := &core.ScanResult{
+		Findings:    findings.NewFindingSet(),
+		Inventory:   &deps.PackageInventory{},
+		AIInventory: ai.NewInventory(),
+	}
+	if err := h.InvokePostScan(context.Background(), result, t.TempDir()); err != nil {
+		t.Fatalf("InvokePostScan should not abort the scan: %v", err)
+	}
+
+	if invoked {
+		t.Error("a non-read-only post-scan tool executed under a passive policy — the read-only gate is bypassed")
+	}
+
+	var reported bool
+	for _, d := range h.Diagnostics() {
+		if strings.Contains(d.Message, "apply_code") {
+			reported = true
+		}
+	}
+	if !reported {
+		t.Error("the blocked post-scan tool was not reported as a diagnostic")
+	}
+}
+
+// TestHost_InvokePostScan_AllowsWhenOperatorOptsIn confirms the gate is a
+// policy decision and not a hard ban: an operator who raises max_risk_class
+// gets the tool they asked for.
+func TestHost_InvokePostScan_AllowsWhenOperatorOptsIn(t *testing.T) {
+	var invoked bool
+
+	mock := &mockPluginServer{
+		manifest: &pluginv1.GetManifestResponse{
+			Name:       "mutating-plugin",
+			Version:    "1.0.0",
+			ApiVersion: HostAPIVersion,
+			Capabilities: []*pluginv1.Capability{{
+				Name: "remediation",
+				Tools: []*pluginv1.ToolDef{{
+					Name:                "apply_code",
+					ReadOnly:            false,
+					RequiresScanContext: true,
+				}},
+			}},
+		},
+		invokeFunc: func(_ context.Context, _ *pluginv1.InvokeToolRequest) (*pluginv1.InvokeToolResponse, error) {
+			invoked = true
+			return &pluginv1.InvokeToolResponse{}, nil
+		},
+	}
+
+	conn := startMockPlugin(t, mock)
+	active := DefaultPolicy()
+	active.MaxRiskClass = RiskClassActive
+	h := newTestHost(WithPolicy(&active))
+	if err := h.RegisterPlugin(context.Background(), conn); err != nil {
+		t.Fatalf("RegisterPlugin: %v", err)
+	}
+
+	result := &core.ScanResult{
+		Findings:    findings.NewFindingSet(),
+		Inventory:   &deps.PackageInventory{},
+		AIInventory: ai.NewInventory(),
+	}
+	if err := h.InvokePostScan(context.Background(), result, t.TempDir()); err != nil {
+		t.Fatalf("InvokePostScan: %v", err)
+	}
+
+	if !invoked {
+		t.Error("an operator who opted in to active risk class did not get the tool they configured")
+	}
+}
+
+// TestHost_InvokePostScan_RefusalDoesNotKillSiblings covers a false block that
+// enforcing post-scan policy introduced.
+//
+// The host — not a caller — enumerates every requires_scan_context tool and
+// invokes them all. Treating a refusal as a terminating RuntimeViolation
+// therefore punished a well-behaved plugin for a tool it never asked to run,
+// and took its READ-ONLY siblings down with it: they then failed with
+// "plugin not ready".
+//
+// A plugin shipping a passive plan_code alongside an active apply_code is the
+// exact shape the SDK docs recommend, so the cascade would have hit the
+// recommended layout. The blocked tool must be skipped, not fatal.
+func TestHost_InvokePostScan_RefusalDoesNotKillSiblings(t *testing.T) {
+	var ran []string
+
+	mock := &mockPluginServer{
+		manifest: &pluginv1.GetManifestResponse{
+			Name:       "mixed-plugin",
+			Version:    "1.0.0",
+			ApiVersion: HostAPIVersion,
+			Capabilities: []*pluginv1.Capability{{
+				Name: "remediation",
+				Tools: []*pluginv1.ToolDef{
+					// Write tool declared FIRST, so a cascade would take out
+					// everything after it.
+					{Name: "apply_code", ReadOnly: false, RequiresScanContext: true},
+					{Name: "plan_code", ReadOnly: true, RequiresScanContext: true},
+					{Name: "verify_code", ReadOnly: true, RequiresScanContext: true},
+				},
+			}},
+		},
+		invokeFunc: func(_ context.Context, req *pluginv1.InvokeToolRequest) (*pluginv1.InvokeToolResponse, error) {
+			ran = append(ran, req.GetToolName())
+			return &pluginv1.InvokeToolResponse{}, nil
+		},
+	}
+
+	conn := startMockPlugin(t, mock)
+	h := newTestHost() // passive default
+	if err := h.RegisterPlugin(context.Background(), conn); err != nil {
+		t.Fatalf("RegisterPlugin: %v", err)
+	}
+
+	result := &core.ScanResult{
+		Findings:    findings.NewFindingSet(),
+		Inventory:   &deps.PackageInventory{},
+		AIInventory: ai.NewInventory(),
+	}
+	if err := h.InvokePostScan(context.Background(), result, t.TempDir()); err != nil {
+		t.Fatalf("InvokePostScan: %v", err)
+	}
+
+	for _, tool := range ran {
+		if tool == "apply_code" {
+			t.Error("the non-read-only tool ran under a passive policy")
+		}
+	}
+
+	for _, want := range []string{"plan_code", "verify_code"} {
+		var found bool
+		for _, tool := range ran {
+			if tool == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("read-only tool %q did not run; blocking a sibling terminated the plugin", want)
+		}
+	}
+
+	if len(h.Plugins()) != 1 {
+		t.Error("the plugin was terminated for a tool the host chose to invoke")
+	}
+}
+
+// TestEveryInvocationPathIsGated catches an invocation path that reaches a
+// plugin without passing the policy gate.
+//
+// This is the guard for a real bypass: enforcement was extracted into
+// authorizeTool with a comment saying "any new invocation path must go through
+// here", and InvokeAll — the path `nox scan` actually uses — did not. It
+// re-inlined only some of the checks, so a tool declaring requirements its
+// policy forbids was blocked on one path and admitted on the shipping one.
+//
+// The property is structural, not behavioural, so it is checked structurally:
+// the raw gRPC client may only be reached from a function that is itself gated.
+// A behavioural test would have to guess which path a future author adds.
+func TestEveryInvocationPathIsGated(t *testing.T) {
+	t.Parallel()
+
+	// Functions permitted to call the raw client. Each is small, and each is
+	// reached only after authorizeTool. Adding a name here is a deliberate
+	// assertion that the caller gates first.
+	gatedCallers := map[string]bool{
+		"invokeRequest": true, // plugin.go — callers gate; see InvokePostScan
+		"InvokeTool":    true, // plugin.go — callers gate; see Host.InvokeTool
+	}
+
+	for _, file := range []string{"host.go", "plugin.go"} {
+		src, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatalf("reading %s: %v", file, err)
+		}
+
+		var current string
+		for i, line := range strings.Split(string(src), "\n") {
+			if strings.HasPrefix(line, "func ") {
+				current = funcName(line)
+			}
+			if !strings.Contains(line, ".client.InvokeTool(") {
+				continue
+			}
+			if !gatedCallers[current] {
+				t.Errorf("%s:%d: %s calls the raw plugin client directly. "+
+					"Every invocation must pass through Host.authorizeTool first — "+
+					"a path that skips it runs plugin tools with no policy, no rate limit "+
+					"and no secret redaction. Route it through the gate, or add it to "+
+					"gatedCallers if its callers gate.", file, i+1, current)
+			}
+		}
+	}
+}
+
+// TestHostInvocationEntryPointsCallAuthorize checks the other direction: every
+// exported Host method that reaches a plugin names the gate.
+func TestHostInvocationEntryPointsCallAuthorize(t *testing.T) {
+	t.Parallel()
+
+	src, err := os.ReadFile("host.go")
+	if err != nil {
+		t.Fatalf("reading host.go: %v", err)
+	}
+
+	// Exported Host methods that invoke plugin tools.
+	entryPoints := []string{"InvokeTool", "InvokeAll", "InvokePostScan"}
+	text := string(src)
+
+	for _, name := range entryPoints {
+		marker := "func (h *Host) " + name + "("
+		start := strings.Index(text, marker)
+		if start < 0 {
+			t.Errorf("%s no longer exists; update this test's list of entry points", name)
+			continue
+		}
+		end := strings.Index(text[start:], "\n}\n")
+		if end < 0 {
+			end = len(text) - start
+		}
+		body := text[start : start+end]
+
+		if !strings.Contains(body, "authorizeTool") && !strings.Contains(body, "authorizeToolWithoutTermination") {
+			t.Errorf("Host.%s invokes plugin tools without calling the authorization gate", name)
+		}
+		if !strings.Contains(body, "processResponse") {
+			t.Errorf("Host.%s delivers plugin output without calling processResponse, "+
+				"so responses are neither bandwidth-checked nor secret-redacted", name)
+		}
+	}
+}
+
+// funcName extracts the identifier from a Go function declaration line.
+func funcName(line string) string {
+	rest := strings.TrimPrefix(line, "func ")
+	if strings.HasPrefix(rest, "(") {
+		if idx := strings.Index(rest, ") "); idx >= 0 {
+			rest = rest[idx+2:]
+		}
+	}
+	if idx := strings.Index(rest, "("); idx >= 0 {
+		return rest[:idx]
+	}
+	return rest
 }

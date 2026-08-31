@@ -13,6 +13,8 @@ package ai
 import (
 	"regexp"
 	"strings"
+
+	"github.com/nox-hq/nox/core/lexctx"
 )
 
 // isSourceFile reports whether path is a code file we should consider for
@@ -173,7 +175,7 @@ func extractSDKInvocations(path string, content []byte) []ModelReference {
 				Name:       name,
 				Registry:   p.provider,
 				Path:       path,
-				Line:       lineForOffset(content, m[0]),
+				Line:       lexctx.LineForOffset(content, m[0]),
 				AuthEnvVar: authGuess,
 				Endpoint:   endpointGuess,
 			})
@@ -186,16 +188,18 @@ func extractSDKInvocations(path string, content []byte) []ModelReference {
 // `process.env.X` style references commonly used to feed LLM clients.
 // Returns the env var name when one matches, or "" otherwise.
 func detectAuthEnvVar(text string) string {
-	// nox:ignore SEC-161,SEC-163,SEC-574 -- these are detector
-	// regex patterns, not credentials. The patterns themselves match
-	// "API_KEY"/"TOKEN"/"SECRET"/"PASSWORD" identifiers in scanned
-	// source; they are not secrets.
+	// These are detector regexes, not credentials: they match
+	// "API_KEY"/"TOKEN"/"SECRET"/"PASSWORD" identifiers in scanned source.
+	//
+	// The waivers are per-line and trailing. A directive applies to exactly one
+	// line, so the single directive that used to sit above this block waived
+	// nothing at all — every pattern below was reported despite looking waived.
 	patterns := []*regexp.Regexp{
-		regexp.MustCompile(`os\.getenv\s*\(\s*["']([A-Z][A-Z0-9_]*(?:API_KEY|TOKEN|SECRET|PASSWORD))["']`),
-		regexp.MustCompile(`os\.environ\[\s*["']([A-Z][A-Z0-9_]*(?:API_KEY|TOKEN|SECRET|PASSWORD))["']`),
+		regexp.MustCompile(`os\.getenv\s*\(\s*["']([A-Z][A-Z0-9_]*(?:API_KEY|TOKEN|SECRET|PASSWORD))["']`), // nox:ignore SEC-161,SEC-163 -- detector pattern, not a credential
+		regexp.MustCompile(`os\.environ\[\s*["']([A-Z][A-Z0-9_]*(?:API_KEY|TOKEN|SECRET|PASSWORD))["']`),   // nox:ignore SEC-161,SEC-163 -- detector pattern, not a credential
 		regexp.MustCompile(`process\.env\.([A-Z][A-Z0-9_]*(?:API_KEY|TOKEN|SECRET|PASSWORD))`),
-		regexp.MustCompile(`process\.env\[\s*["']([A-Z][A-Z0-9_]*(?:API_KEY|TOKEN|SECRET|PASSWORD))["']`),
-		regexp.MustCompile(`os\.Getenv\s*\(\s*"([A-Z][A-Z0-9_]*(?:API_KEY|TOKEN|SECRET|PASSWORD))"\s*\)`),
+		regexp.MustCompile(`process\.env\[\s*["']([A-Z][A-Z0-9_]*(?:API_KEY|TOKEN|SECRET|PASSWORD))["']`), // nox:ignore SEC-161,SEC-163 -- detector pattern, not a credential
+		regexp.MustCompile(`os\.Getenv\s*\(\s*"([A-Z][A-Z0-9_]*(?:API_KEY|TOKEN|SECRET|PASSWORD))"\s*\)`), // nox:ignore SEC-161,SEC-163 -- detector pattern, not a credential
 	}
 	for _, re := range patterns {
 		if m := re.FindStringSubmatch(text); len(m) > 1 {
@@ -223,7 +227,6 @@ func detectEndpoint(text string) string {
 	}
 	return ""
 }
-
 
 // frameworkPattern recognises agent / vector-store framework usage and
 // emits a Component for the inventory. Designed to over-report — a single

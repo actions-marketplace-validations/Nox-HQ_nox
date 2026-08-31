@@ -7,37 +7,60 @@ name: Refresh security badge
 # is labelled `badge` and auto-merged once required checks pass —
 # branch protection is satisfied because the merge comes from a PR,
 # not a direct push.
+#
+# That last sentence was false for as long as this workflow existed, for two
+# independent reasons, and PR #397 sat permanently unmergeable as a result:
+#
+#   1. GitHub does not start workflow runs for events raised by GITHUB_TOKEN.
+#      A PR opened with that token therefore reports NO checks at all, so the
+#      required contexts (Lint, Test, Build & Scan) can never pass and
+#      auto-merge can never fire. Opening with NOX_TOKEN — a PAT, already
+#      present because GITHUB_TOKEN cannot push under .github/workflows — makes
+#      the PR behave like a human one and actually run CI.
+#   2. The commit message carried `[skip ci]`, which suppresses CI even when
+#      the token would have triggered it. Belt and braces on the same mistake.
+#
+# The token falls back to GITHUB_TOKEN when NOX_TOKEN is absent: that restores
+# the old (stuck) behaviour rather than failing the run outright, so a fork or
+# a repo without the secret still refreshes badges and merely needs a manual
+# merge.
 
 on:
   release:
     types: [published]      # primary trigger — every published release
   schedule:
-    - cron: "17 6 * * *"    # daily safety net for between-release drift
-  workflow_dispatch:
+    - cron: "17 6 * * 1"    # weekly safety net (Mon). Release+CI events keep badges fresh.
+  workflow_dispatch: # nox:ignore IAC-308 -- badge refresh is run on demand after a release
   workflow_run:
     workflows: ["CI"]
     types: [completed]
     branches: [main]
 
 permissions:
-  contents: write
+  contents: write # nox:ignore IAC-314 -- opens the badge-refresh PR
   pull-requests: write
 
 concurrency:
   group: badge-refresh
-  cancel-in-progress: true
+  cancel-in-progress: true # nox:ignore IAC-309 -- only the newest badge scan is meaningful
 
 jobs:
   refresh:
     if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
           fetch-depth: 0
+          # peter-evans/create-pull-request sets its own Authorization
+          # header. If checkout also persists one, git push hits
+          # "Duplicate header: Authorization" → HTTP 400. Drop the
+          # checkout-side credential so only the action's token is in
+          # play.
+          persist-credentials: false
 
-      - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
 
@@ -52,11 +75,29 @@ jobs:
       - name: Generate badges
         run: ./nox badge --input nox-results/findings.json --output .github/nox-badge.svg --by-severity || true
 
+      # Bail out early when no SVG actually changed. The default
+      # GITHUB_TOKEN can't always push to a feature branch under
+      # branch protection — repositories without "Allow GitHub
+      # Actions to create and approve pull requests" enabled get a
+      # HTTP 400 from git push. Detect the no-change case so a
+      # routine self-scan (where findings counts match the previous
+      # run) doesn't go red.
+      - name: Detect badge diff
+        id: diff
+        run: |
+          if git diff --quiet -- .github/nox-badge.svg .github/nox-critical.svg .github/nox-high.svg .github/nox-medium.svg .github/nox-low.svg; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Badges unchanged; skipping PR open."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Open PR with refreshed badges
-        uses: peter-evans/create-pull-request@5e914681df9dc83aa4e4905692ca88beb2f9e91f # v7.0.5
+        if: steps.diff.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          commit-message: "ci: refresh security badges [skip ci]"
+          token: ${{ secrets.NOX_TOKEN || secrets.GITHUB_TOKEN }}
+          commit-message: "ci: refresh security badges"
           title: "ci: refresh security badges"
           body: |
             Automated refresh of `.github/nox-badge.svg` and the

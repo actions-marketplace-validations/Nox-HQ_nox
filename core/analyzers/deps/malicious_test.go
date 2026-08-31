@@ -1,6 +1,7 @@
 package deps
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -289,7 +290,7 @@ func TestScanArtifacts_MaliciousPackageDetection(t *testing.T) {
 	}
 
 	analyzer := NewAnalyzer(WithOSVDisabled())
-	_, fs, err := analyzer.ScanArtifacts(artifacts)
+	_, fs, err := analyzer.ScanArtifacts(context.Background(), artifacts)
 	if err != nil {
 		t.Fatalf("ScanArtifacts returned error: %v", err)
 	}
@@ -329,7 +330,7 @@ func TestScanArtifacts_TyposquattingDetection(t *testing.T) {
 	}
 
 	analyzer := NewAnalyzer(WithOSVDisabled())
-	_, fs, err := analyzer.ScanArtifacts(artifacts)
+	_, fs, err := analyzer.ScanArtifacts(context.Background(), artifacts)
 	if err != nil {
 		t.Fatalf("ScanArtifacts returned error: %v", err)
 	}
@@ -381,7 +382,7 @@ func TestScanArtifacts_LegitimatePackagesNoFindings(t *testing.T) {
 	}
 
 	analyzer := NewAnalyzer(WithOSVDisabled())
-	_, fs, err := analyzer.ScanArtifacts(artifacts)
+	_, fs, err := analyzer.ScanArtifacts(context.Background(), artifacts)
 	if err != nil {
 		t.Fatalf("ScanArtifacts returned error: %v", err)
 	}
@@ -427,5 +428,32 @@ func TestMaliciousPackagesLoaded(t *testing.T) {
 	pypiMal, ok := maliciousPkgs["pypi"]
 	if !ok || len(pypiMal) == 0 {
 		t.Fatal("expected non-empty pypi malicious packages list")
+	}
+}
+
+func TestDetectTyposquatting_PEP503Canonical(t *testing.T) {
+	// Canonical names with underscores must NOT be flagged as typosquats of
+	// their hyphenated popular form (PEP 503 treats them as equal).
+	for _, name := range []string{"huggingface_hub", "python_pptx", "scikit_learn"} {
+		if pop, ok := DetectTyposquatting(name, "pypi", 2); ok {
+			t.Errorf("%s flagged as typosquat of %q (PEP 503 canonical, should be exact match)", name, pop)
+		}
+	}
+}
+
+// TestDetectTyposquatting_PopularNotFlagged is a regression test: popular
+// packages that happen to sit within edit distance of ANOTHER popular package
+// (vue↔vuex, etc.) must not be flagged as typosquats, and short names must not
+// false-positive at distance 2 — while a genuine typo is still caught.
+func TestDetectTyposquatting_PopularNotFlagged(t *testing.T) {
+	// These are themselves popular npm packages; none is a typosquat.
+	for _, name := range []string{"vue", "zod", "ms", "ajv", "react", "lodash", "express"} {
+		if popular, ok := DetectTyposquatting(name, "npm", 2); ok {
+			t.Errorf("%q flagged as typosquat of %q, but it is a popular package itself", name, popular)
+		}
+	}
+	// A genuine one-character typo of a popular package is still detected.
+	if _, ok := DetectTyposquatting("expres", "npm", 2); !ok {
+		t.Error("expected 'expres' to be flagged as a typosquat of 'express'")
 	}
 }

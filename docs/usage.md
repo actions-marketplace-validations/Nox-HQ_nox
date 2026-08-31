@@ -83,6 +83,18 @@ nox scan . -q
 
 # Verbose mode for debugging
 nox scan . -v
+
+# Scan a single file (fast pre-commit hooks, editor integrations)
+nox scan path/to/app.py
+
+# Scan only git-tracked files (exclude untracked scratch/build files)
+nox scan . --tracked-only
+
+# Zero-network guarantee — records "offline": true in findings.json meta
+nox scan . --offline
+
+# Order findings by priority (severity, then reachability) instead of rule/path
+nox scan . --sort priority
 ```
 
 The scan pipeline:
@@ -282,6 +294,9 @@ nox baseline <write|update|show> [path] [flags]
 **Subcommands:**
 
 ```bash
+# One-command adoption: record existing debt + print the gate-the-change policy
+nox baseline init
+
 # Write a baseline from all current findings
 nox baseline write .
 
@@ -422,6 +437,239 @@ nox completion fish | source
 # PowerShell
 nox completion powershell | Out-String | Invoke-Expression
 ```
+
+### lsp
+
+Run the nox Language Server on stdio (JSON-RPC 2.0). Editors connect to it to
+surface findings as inline diagnostics — squiggles, hover, the Problems panel —
+on open and save. Deterministic and offline: it runs the local `nox` binary; no
+code leaves the machine.
+
+```bash
+# Spoken by the editor extension over stdio; not run by hand.
+nox lsp
+```
+
+The VS Code extension in [`editors/vscode`](../editors/vscode) is a thin client
+over it (`npm install && npm run compile`, then F5 in the Extension Development
+Host). A JetBrains plugin is the same shape against the same server.
+
+### mcp
+
+Baseline an MCP server's tool manifest and detect drift (a rug-pull: a server
+that shows a benign manifest at review time, then serves a changed or malicious
+one later). Drift is emitted as findings, flowing into `findings.json` /
+`results.sarif` and gating CI like any scan.
+
+```bash
+nox mcp baseline -- nox serve      # capture .nox/mcp-baseline.json (commit it)
+nox mcp drift    -- nox serve      # re-capture and report drift (exit 1 on drift)
+nox mcp show                       # print the stored baseline
+```
+
+The baseline is local, sorted JSON — diff it, commit it, review drift in PRs.
+**Security:** these commands launch the server as a subprocess; never run an
+untrusted MCP server un-sandboxed. See
+[mcp-drift-baseline.md](./mcp-drift-baseline.md) for the full model, rule/severity
+mapping, and sandbox guidance.
+
+### fix
+
+Generate remediations from a prior scan's `findings.json`.
+
+```bash
+# Dependency upgrades for VULN findings (applies unless --dry-run)
+nox fix
+
+# SHA-pin GitHub Actions `uses:` refs (needs GITHUB_TOKEN)
+nox fix --actions
+
+# Deterministic patches for mechanical IaC misconfigs — preview only by default
+nox fix --content
+
+# ...apply them
+nox fix --content --write
+```
+
+`--content` rewrites the flagged line to its one unambiguous secure value
+(Kubernetes hardening flips, Terraform encryption/HTTPS/ACL, Dockerfile
+`ADD`→`COPY`, …). It is template-free and uses no LLM — rules that need a value
+choice (a UID, a pinned digest, an allowlist, a rotated secret) are never
+touched. It previews the diff and applies nothing without `--write`.
+
+#### What `fix` does not remediate
+
+`fix` covers dependencies, Action pins and mechanical configuration. It does
+**not** fix SAST findings — taint flows (`TAINT-*`) and the code-level `SEC-*`
+rules are reported and left alone.
+
+That is deliberate rather than unfinished. A taint finding says user input
+reaches a dangerous sink; removing it means choosing the right sanitiser for
+that specific sink, which depends on what the code is meant to do. The failure
+mode is not a broken build — it is inserting something the taint engine
+recognises as a sanitiser that does not actually sanitise, so the finding
+disappears while the vulnerability stays. nox would then be marking its own
+homework, and a green scan would mean less than it does now.
+
+The same logic is why a hardcoded secret is not auto-fixed. Moving the literal
+into an environment variable silences the rule, but the credential is already in
+the git history and is compromised the moment it is committed; the fix that
+matters is rotating it at the provider.
+
+nox will not do that for you, and the reason is worth stating rather than
+implying. Revoking a credential means calling the provider's API with *another*
+credential — usually one more privileged than the key that leaked. A scanner
+that could revoke your AWS keys is a scanner holding AWS admin credentials, and
+that makes it the highest-value target in your organisation: compromising it
+would be strictly worse than the leak it was defending against. It also
+contradicts what nox is — read-only by default, no required external services.
+
+The one system that does close this loop is GitHub's secret scanning partner
+program, and it manages it by being the host rather than by being more capable:
+AWS, Stripe, npm and others have onboarded an endpoint that GitHub reports
+matches to, and they revoke on their side. That is an ecosystem relationship,
+not a feature — there is nothing for a scanner to implement. If you want
+automatic revocation, enable GitHub secret scanning alongside nox; the two do
+not overlap on this point.
+
+#### `nox verify-secrets`: is the credential still live?
+
+What nox *can* do is ask the issuer whether a detected credential still works,
+using the leaked credential itself — which needs no privilege beyond what is
+already public.
+
+```bash
+nox scan . -format json -output out
+nox verify-secrets --input out/findings.json
+```
+
+```
+  SEC-003  config/app.js:1   LIVE   authenticates against the GitHub API (ghp_…)
+
+checked 1 credential(s); 1 still authenticate
+```
+
+That distinction is the difference between a backlog item and an incident. "This
+looks like a GitHub token" can wait; "this is a working token" cannot, because
+the credential is already public and removing the file does not invalidate it.
+Exit status is 1 when anything still authenticates, so a pipeline can act on it
+without parsing output.
+
+Two properties are deliberate and enforced by tests:
+
+- **The endpoints are compiled in.** Verification sends a live credential to a
+  third party, which is defensible only because that party is the issuer. If the
+  endpoint were configurable, this command would be a way to exfiltrate every
+  secret in a repository — point it at a host you control and they are delivered
+  to you. No flag, config key or environment variable redirects them.
+- **The secret never appears in output.** Reports show a provider prefix and an
+  ellipsis. The point is to report that a credential works, not to reproduce it
+  somewhere new.
+
+Anything other than a clear yes or no — rate limiting, an outage — reports
+`unknown`. Calling a live credential `revoked` because the issuer was briefly
+unreachable would be worse than not checking at all.
+
+Currently covers GitHub tokens (`SEC-003`, `SEC-213`, `SEC-435`, `SEC-495`,
+`SEC-496`). AWS is absent on purpose: verifying an AWS key requires SigV4
+request signing and the paired secret access key, which is a different shape of
+work rather than another entry in a table.
+
+So: a clean `fix` run means the remediable classes were handled. It is not a
+statement that the SAST findings were.
+
+#### `--outdated`: currency, not security
+
+By default `fix` upgrades a dependency only when a `VULN-001` finding names a
+`fixed_in` version. It acts on evidence of a vulnerability, not on the passage
+of time — so a dependency that is merely old is never touched.
+
+That is the right default, but it leaves a gap if `fix` is the only thing
+maintaining your dependencies: outdated-but-not-vulnerable packages drift
+indefinitely. `--outdated` is the opt-in currency pass.
+
+```bash
+nox fix --outdated --dry-run     # what is behind, and by how much
+nox fix --outdated               # apply, then `go mod tidy`
+nox fix --outdated --include-major
+```
+
+It is a separate flag on purpose. A security fix is something you want applied
+without argument; routine version churn is a choice with its own risk of
+breaking a build. Kept together, you could no longer tell from the fact that
+`fix` changed something whether there had been a vulnerability at all — so
+currency upgrades are reported as `OUTDATED`, never as `VULN-001`.
+
+Scope and guarantees:
+
+- **Seven ecosystems:** Go, npm, PyPI, Cargo, RubyGems, Composer and NuGet. Go
+  resolves through `go list -m -u -json all`, which already understands replace
+  directives, retractions and the module graph. The rest query their own
+  registry directly, so planning needs no toolchain — only *applying* an upgrade
+  shells out to `npm` / `pip` / `cargo` / `bundle` / `composer` / `dotnet`.
+  Maven and Gradle are parsed by the scanner but have no currency resolver:
+  `maven-metadata.xml` has no single "latest stable" and Gradle has no canonical
+  upgrade command, so they are reported as unresolved rather than guessed at.
+- **Latest STABLE, never a prerelease.** Every registry expresses this
+  differently and most of them invite the wrong answer: npm publishes channels
+  under `dist-tags` where only `latest` is stable; crates.io reports
+  `max_version` (including prereleases) beside `max_stable_version`; Packagist
+  returns newest-first but mixes in `dev-<branch>` aliases; and NuGet returns an
+  *ascending* list with prereleases interleaved, so its last element is often a
+  beta. A package with no stable release yields no suggestion at all.
+- **Direct dependencies only.** Indirect ones belong to the lockfile resolver —
+  bumping them writes explicit requirements for packages you do not import.
+  Directness comes from the *manifest* (`go.mod`, `package.json`, `Cargo.toml`,
+  `requirements.txt`, `Gemfile`, `composer.json`, `*.csproj`); the resolved current version comes from the lockfile,
+  because a manifest range like `^4.18.0` is not a version. A range with no
+  lockfile entry is skipped rather than assigned a version it does not have.
+- **Never downgrades.** A replace directive or retracted version can make
+  `go list` report an "update" that is not newer; those are dropped.
+- **Major bumps held** unless `--include-major`, and counted so you can see
+  something is waiting.
+- **Anything unchecked is reported, not assumed current.** An unreachable or
+  rate-limiting registry, a manifest that exists but cannot be parsed, and a
+  directory with no supported manifest at all each produce a `degraded:` line —
+  and the "all dependencies are current" message is suppressed whenever one
+  appears. There is a real difference between "checked seven ecosystems and
+  everything is current" and "found nothing to check", and only one of them is
+  good news. Same contract as scan degradations.
+- **Reaches the network.** This is the one thing that cannot be answered
+  offline. It runs only behind this flag, never as part of a scan, so nox's
+  offline-first scanning guarantee is unaffected.
+
+`--outdated` is a *mode*, not a modifier: like `--content`, it returns before
+the dependency and Action passes run. `nox fix --outdated --actions` therefore
+does the currency pass **only** and silently skips Action pins. To do both, run
+two commands:
+
+```bash
+nox fix --actions --input findings.json --root .
+nox fix --outdated --root .
+```
+
+### variants
+
+Report first-party code that reproduces the root-cause pattern of a known CVE —
+variants a version-based SCA can't see because there's no vulnerable dependency,
+just the same insecure shape written locally. Deterministic and offline.
+
+```bash
+# Scan the current tree for every known CVE variant
+nox variants .
+
+# Only Log4Shell-style variants
+nox variants CVE-2021-44228 .
+
+# List the built-in signatures without scanning
+nox variants --list
+```
+
+Ships signatures for Log4Shell (CVE-2021-44228), PyYAML full-loader
+(CVE-2020-14343), tar `extractall` without a filter (CVE-2007-4559), Zip Slip
+(CVE-2018-1002200), Jinja SSTI (CVE-2019-10906), and `child_process` shell
+interpolation (CVE-2021-21315). The same `VARIANT-*` findings also appear in a
+normal `nox scan`. Exit code is `1` when variants are found, `0` when clean.
 
 ### serve
 
@@ -620,6 +868,31 @@ scan:
 
 This is useful for reducing noise from dependencies in `node_modules/` or test fixtures.
 
+### Predictive Slopsquat Feed (SLOP-002)
+
+The SLOP analyzer can consume a versioned, offline **predictive slopsquat
+blocklist** — a signed, content-addressed list of package names an LLM is likely
+to hallucinate that were verified *unregistered (squattable)* when the feed was
+generated. When an imported name matches a high-risk entry, `SLOP-002` fires with
+a severity derived from the entry's risk tier.
+
+It is **opt-in and off by default**: with no feed configured the analyzer's
+`SLOP-001` behavior is unchanged. Enabling a feed is purely additive.
+
+```yaml
+scan:
+  slop:
+    feed: bundled                 # ship-in-binary feed; or a path to a feed JSON
+    require_signature: false      # reject unsigned/bad-signature feeds
+    signature_key_path: keys/slopsquat.pub.pem   # PEM Ed25519 public key
+```
+
+No network is touched at scan time — only the out-of-band generator
+(`cmd/slopfeed`) queries registries. A malformed, tampered, or digest-mismatched
+feed fails closed (predictive dimension off, a visible `slop_feed` degradation
+recorded). See [docs/slopsquat-feed.md](slopsquat-feed.md) for the feed format,
+trust model, regeneration, and the responsible-disclosure note.
+
 ### Conditional Severity
 
 Override severity based on rule patterns and paths:
@@ -641,6 +914,65 @@ scan:
         - "**/node_modules/**"
       severity: info    # Only show as informational
 ```
+
+### Generated Paths (content-rule noise filter)
+
+The content rule families (`AI-*`, `MCP-*`) are not run against generated and
+vendored files — lockfiles, minified bundles, generated type definitions —
+because those files are not human-authored and only ever yield false
+positives there. This is **on by default** with a sensible built-in set
+(`package-lock.json`, `pnpm-lock.yaml`, `*.min.js`, `worker-configuration.d.ts`,
+`*.pb.go`, `*_pb2.py`, `*.generated.*`, …).
+
+Dependency scanning is unaffected: the deps analyzer still reads lockfiles
+directly, so this never hides a real CVE.
+
+```yaml
+scan:
+  generated_paths:
+    # disabled: true        # turn the filter off entirely
+    extend:                  # add to the built-in set
+      - "internal/gen/*.go"
+      - "*.snap"
+    # override: [...]        # replace the built-in set entirely (advanced)
+```
+
+Tune precedence: `disabled` wins; otherwise `override` (if set) replaces the
+defaults; otherwise the defaults plus `extend` apply.
+
+### Context-gated severity (non-production downgrade)
+
+A code-pattern finding in test, example, docs, or vendored/generated code is far
+less actionable than the same finding in shipping source. Nox applies the
+deterministic, path-based analogue of dependency reachability gating: it
+**downgrades by one severity level** (critical→high→medium→low→info) any
+code-pattern finding whose file sits in a non-production tree.
+
+This is **on by default**. To turn it off:
+
+```yaml
+scan:
+  context_downgrade: false
+```
+
+Scope — non-production paths (case-insensitive, `**` spans any depth):
+`**/test/**`, `**/tests/**`, `*_test.*`, `**/testdata/**`, `**/example/**`,
+`**/examples/**`, `**/docs/**`, `**/vendor/**`, `**/node_modules/**`,
+`**/*.min.js`, `**/dist/**`, `**/build/**`, `**/generated/**`, `**/__mocks__/**`.
+
+Scope — rule families downgraded: the code-pattern families whose actionability
+depends on where the code ships — `AI-*`, `MCP-*`, `AGENT-*`, `IAC-*`, `TAINT-*`,
+`SLOP-*`, `VARIANT-*`. Deliberately **excluded**:
+
+- `SEC-*` — a secret committed in a test fixture is frequently a real, leaked
+  credential; it is graded by the secret, not by the file.
+- `VULN-*`, `CONT-*`, `LIC-` — dependency/container/license facts. The risk is a
+  property of the package, not of the manifest's location.
+
+Downgraded findings are auditable: the original level is preserved in
+`original_severity` and `context: non-production` is recorded in the finding
+metadata. An explicit `conditional_severity` override always wins — it runs
+first and is never re-downgraded.
 
 ### .noxignore
 
@@ -721,6 +1053,157 @@ policy:
   baseline_mode: strict
 ```
 
+#### Via MCP
+
+The evidence surface is on the MCP server too, because an agent triaging a scan
+needs it more than a person does — a person can read the terminal and notice
+what is missing.
+
+| tool | what it answers |
+|---|---|
+| `analysis_capabilities` | what this installation can establish, and what **this scan** actually established |
+| `why` | the eight questions for a finding (fingerprint, prefix, or rule ID) |
+
+`analysis_capabilities` is the one worth calling before summarising a scan. The
+MCP surface already carried degradations, which say a check *broke*; nothing
+said a question was never *asked*. A capability that is provided but answered
+nothing was available and unused — not a clean result.
+
+MCP scans record reasoning so `why` has evidence to answer from. Both tools are
+read-only, like the rest of the MCP surface.
+
+#### `nox why` — the eight questions
+
+```sh
+nox why .                 # every finding
+nox why . SEC-003         # one rule
+nox why . 65f66b3f2c17    # one finding, by fingerprint prefix
+```
+
+Answers, for each finding: what was observed, why it matters, what supports it,
+what argues against it, **what was not evaluated**, the potential impact,
+**whether it affects this application**, and what to do.
+
+The two in bold are the ones a scanner usually leaves out. An analysis that
+never ran is a gap, not a limit, and silence about it lets a reader assume
+everything was looked at — so `nox why` names each capability that reached no
+conclusion, and distinguishes "nothing on this installation can establish it"
+from "the analysis ran and could not tell" from "nothing asked here", because
+your next step differs in each case.
+
+It is deterministic: it reads only what the scan established, so the same
+finding always produces the same answers and every sentence traces to a claim, a
+capability state, or the rule's own metadata. `nox explain` is the other one —
+it asks a language model to write prose, which is useful for different reasons.
+Only one of them can be put in front of an auditor.
+
+`--json` emits the structured form.
+
+#### Keeping the evidence: `--evidence-out` and `nox replay`
+
+A scan gathers evidence for and against every candidate it considers, and throws
+it away when the scan ends — it lives out-of-band because carrying it inline
+costs about 2.4x the size of the findings themselves on a large repository.
+
+`--evidence-out` keeps it:
+
+```sh
+nox scan . --evidence-out evidence.json
+nox replay evidence.json
+```
+
+`nox replay` re-derives every verdict in the artifact from the evidence the
+artifact contains, and reports any that come out differently. It reads nothing
+else — not your repository, not the rules, not the network — which is what makes
+it still answerable months later, when all three have moved on.
+
+```
+37 verdict(s) reproduced exactly under adjudicator 1
+```
+
+Exit code is `0` when every verdict reproduced, `1` when one did not. A verdict
+that differs because nox's adjudicator itself changed is reported as a change
+rather than a failure, and still exits `0`:
+
+```
+12 verdict(s) replayed under adjudicator 2 against an artifact from 1;
+3 differ, which is a change in adjudication rather than a defect
+```
+
+The artifact holds the scan's input identity, what each analysis capability
+established, every claim with its provenance, the relationships between
+subjects, and the adjudicated verdict for each finding. `--json` emits the
+replay result for a CI step to read.
+
+Two things it deliberately does not do. It does not re-run the scan, so it
+cannot tell you whether your code still has the finding — that is `nox scan`. And
+it is not a full historical reconstruction: the rule set, analyzer versions and
+advisory data are not snapshotted, so it answers "does this evidence support
+this verdict?" rather than "would this scan happen again identically?".
+
+#### Two confidences, and which one filters
+
+A finding carries two confidence values, and they answer different questions:
+
+| Field | Question | Range on a static scan |
+|---|---|---|
+| `Confidence` | How likely is this a true positive? | `high`, `medium`, `low` |
+| `EvidenceConfidence` | What strength of evidence was recorded for it? | `LOW`, `MEDIUM` |
+
+`--min-confidence` filters on the first. It is the analyzer's calibrated
+judgement about its own rule, and on nox's precision corpus it is accurate — 37
+true positives, no false ones.
+
+`EvidenceConfidence` appears only on scans that recorded reasoning, and it is a
+statement about the *ledger*, not about the world. It cannot exceed `MEDIUM` on
+a static scan: the evidence model puts `HIGH` at the strength of a controlled
+reproduction, a confirming source or a published advisory, and reading code
+does not produce those. A finding at `high` confidence with `MEDIUM` evidence
+is the ordinary case, not a contradiction — it means the rule is reliable and
+nothing has independently corroborated this particular hit.
+
+Do not filter on `EvidenceConfidence` expecting it to behave like
+`Confidence`. Requiring `HIGH` would match nothing on any project.
+
+#### Requiring an analysis to have run
+
+`fail_on` gates on what nox found. The two settings below gate on what nox was
+able to determine, which is a different question and the one that goes wrong
+quietly — a scan whose analysis could not run reports no findings, and no
+findings looks exactly like a clean result.
+
+```yaml
+policy:
+  uncertainty: fail                        # warn (default) | fail | ignore
+  require_capabilities: [reachability]     # empty by default
+```
+
+**`require_capabilities`** — the analyses this project's triage depends on.
+Empty by default, which is every existing repository and changes nothing for
+them. Listing one asserts that you rely on that question being answered, and
+nox will tell you when it stops being. Run `nox analysis-capabilities` to see
+the names and what this installation provides.
+
+A requirement is met only when the capability is provided **and this scan
+actually reached a conclusion with it**. Those come apart the moment something
+fails at runtime, which is the only moment the setting exists for. Three ways it
+can go unmet, worded apart because each needs a different response:
+
+| Message | What happened | What to do |
+|---|---|---|
+| `not provided by this installation` | Nothing on this build can answer it | Install the plugin that provides it |
+| `ran but could not determine anything` | The analysis ran and came back empty | Look at why — a slow or partial source, a timeout |
+| `provided, but nothing in this scan put the question` | The capability exists and this scan never used it | Check the scan reached the code you think it did |
+
+**`uncertainty`** — what an unmet requirement does. `warn` (the default) prints
+and does not change the exit code; `fail` exits non-zero; `ignore` skips the
+check. A mistyped value is rejected rather than resolved to the permissive
+default.
+
+Worth knowing what this does *not* cover: `require_capabilities` speaks about
+analyses, not about every check completing. For "fail if any part of the scan
+did not finish", use `--fail-on-degraded`.
+
 ### Explain Defaults
 
 The `explain` section configures defaults for `nox explain`. CLI flags always take precedence.
@@ -799,6 +1282,21 @@ INSERT INTO users (token) VALUES ('test-token');
 
 **Supported comment styles:** `//` (Go, JS, Java, C, Rust), `#` (Python, Ruby, Shell, YAML), `--` (SQL, Lua), `/*` (CSS, C), `<!--` (HTML, XML).
 
+**Keep a dedicated directive on one line.** A dedicated comment applies to the
+**next non-blank line**. If the reason wraps onto a second comment line, the
+waiver lands on that continuation comment instead of the code — the finding is
+still reported, with nothing to indicate the suppression missed:
+
+```go
+// nox:ignore SEC-001 -- this reason wraps onto
+// a second line, so the waiver targets THIS comment
+var testKey = "AKIAEXAMPLEFAKEKEY" // still reported
+```
+
+Write it on a single line, or put it as a trailing comment on the finding's own
+line. Consecutive `nox:ignore` comments are fine — stacked directives all apply
+to the next line of code.
+
 Suppressed findings are marked with `status: "suppressed"` in the output and do not count toward policy failure.
 
 ---
@@ -840,6 +1338,18 @@ Nox's canonical findings format. Contains all findings with fingerprints, severi
 }
 ```
 
+A finding reported by a rule that absorbed a retired rule ID carries two extra
+fields, omitted everywhere else (see [Retired rule IDs](#retired-rule-ids)):
+
+```json
+      "RetiredRuleIDs": ["IAC-310"],
+      "AliasFingerprints": ["faae53ee..."]
+```
+
+`RetiredRuleIDs` are the IDs this finding also answers to, and
+`AliasFingerprints` the fingerprints those rules would have produced for it —
+what a baseline or VEX document written before the retirement holds.
+
 ### results.sarif
 
 SARIF 2.1.0 format, compatible with GitHub Code Scanning. Upload directly:
@@ -860,7 +1370,7 @@ Generated from dependency lockfile analysis. Supported ecosystems:
 
 | Lockfile | Ecosystem |
 |----------|-----------|
-| `go.sum` | Go |
+| `go.mod` (with `go.sum`) | Go |
 | `package-lock.json` | npm |
 | `requirements.txt` | PyPI |
 | `Gemfile.lock` | RubyGems |
@@ -868,6 +1378,14 @@ Generated from dependency lockfile analysis. Supported ecosystems:
 | `pom.xml` | Maven |
 | `build.gradle`, `build.gradle.kts` | Gradle |
 | `packages.lock.json` | NuGet |
+
+> **Go:** versions come from `go.mod`, which records what Minimal Version
+> Selection actually chose. `go.sum` is not used as the version source — it
+> hashes the entire module graph, including versions the build never selects,
+> so scanning it directly reports vulnerabilities against code that is never
+> compiled. It is consulted only to recover modules that Go 1.17+ module graph
+> pruning omits from `go.mod`, and only for entries with a source hash (a
+> `/go.mod`-only entry means the module's code was never downloaded).
 
 ### AI Inventory
 
@@ -941,7 +1459,30 @@ jobs:
 | `output` | `nox-results` | Output directory for reports |
 | `version` | `latest` | Nox version to install (e.g., `0.1.0` or `latest`) |
 | `fail-on-findings` | `true` | Fail the step if findings are detected |
+| `fail-on-degraded` | `false` | Fail the step if any check could not complete (OSV lookup, plugin, lockfile parse) |
 | `annotate` | `true` | Post inline PR annotations for findings |
+| `severity-threshold` | — | Report only findings at or above this severity (`critical`, `high`, `medium`, `low`) |
+| `min-confidence` | — | Report only findings at or above this confidence (`high`, `medium`, `low`) |
+| `vex` | — | Path to an OpenVEX waiver document |
+| `changed-since` | — | Scan only files changed since this git ref (e.g. `origin/main`) |
+| `offline` | `false` | Guarantee zero network: no API, no token, no telemetry |
+| `pr-comment` | `false` | Post inline PR review comments with finding details |
+| `max-comments` | `25` | Maximum number of inline PR comments to post |
+| `min-severity` | `low` | Minimum severity for PR comments |
+
+`fail-on-degraded` is worth setting on a gate you actually rely on. Without it,
+an OSV outage, a required plugin that failed to install, or a lockfile nox
+cannot parse produces a green step that proves nothing — a scan that could not
+look is indistinguishable from one that found nothing. The degraded exit
+outranks the findings verdict, and reports are written before it, so the job
+still uploads its SARIF:
+
+```yaml
+      - uses: nox-hq/nox@v1
+        with:
+          format: sarif
+          fail-on-degraded: 'true'
+```
 
 **Action outputs:**
 
@@ -950,7 +1491,7 @@ jobs:
 | `findings-count` | Number of findings detected |
 | `sarif-file` | Path to `results.sarif` (if generated) |
 | `findings-file` | Path to `findings.json` (if generated) |
-| `exit-code` | Raw nox exit code (`0`/`1`/`2`) |
+| `exit-code` | Raw nox exit code (`0` no findings, `1` findings, `2` error or an incomplete check under `fail-on-degraded`) |
 
 **Generate all formats and upload as artifact:**
 
@@ -1033,16 +1574,36 @@ jobs:
 
 ```yaml
 nox-scan:
-  image: golang:1.25
+  stage: security
+  image:
+    name: ghcr.io/nox-hq/nox:v1.2.0  # pin a release tag, not :latest
+    entrypoint: [""]
+  variables:
+    GIT_DEPTH: "0"  # full history so --changed-since can diff the target branch
   script:
-    - go install github.com/nox-hq/nox/cli@latest
-    - nox scan . --format sarif,json --output results/
+    - |
+      ARGS="--format sarif,json --output nox-out --severity-threshold high"
+      [ -f vex.json ] && ARGS="$ARGS --vex vex.json --fail-on-unwaived"
+      if [ -n "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME" ]; then
+        git fetch --depth=50 origin "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
+        ARGS="$ARGS --changed-since origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
+      fi
+      nox scan $ARGS .
   artifacts:
+    when: always
     paths:
-      - results/
-    reports:
-      sast: results/results.sarif
+      - nox-out/results.sarif
+      - nox-out/findings.json
 ```
+
+> **Note:** publish the SARIF as a plain artifact, not via
+> `artifacts:reports:sast`. GitLab's SAST report widget expects GitLab's own
+> JSON schema, not SARIF, so pointing it at `results.sarif` does not populate
+> the MR security widget. Download the artifact or feed the SARIF to a viewer.
+
+A complete, copy-paste-ready version (merge-request-scoped scanning, VEX
+waivers, gating) lives in
+[`examples/gitlab-ci/`](../examples/gitlab-ci/).
 
 ### Generic CI
 
@@ -1083,7 +1644,6 @@ nox serve --allowed-paths /path/to/project
 | `baseline_add` | Add a finding to the baseline | `path`, `fingerprint` (required), `reason` |
 | `plugin.list` | List registered plugins | (none) |
 | `plugin.call_tool` | Invoke a plugin tool | `tool`, `input` (object), `workspace_root` |
-| `plugin.read_resource` | Read a plugin resource | `plugin`, `uri` |
 
 All tools are **read-only**. Output is truncated at **1 MB**.
 
@@ -1220,7 +1780,43 @@ nox scan . -q || exit 1
 
 ## Built-in Rules Reference
 
-Nox ships with **1506 built-in rules** across five analyzer suites: Secrets (938), AI Security (50), IAC (500), Data Protection (12), and Dependencies (6).
+Nox ships with **1496 built-in rules** across five analyzer suites: Secrets (938), AI Security (50), IAC (490), Data Protection (12), and Dependencies (6).
+
+### Retired rule IDs
+
+When two rules turn out to report the same condition, one ID is retired and the
+other keeps reporting it. Your waivers do not need to be rewritten: a retired ID
+stays valid everywhere it was already accepted.
+
+- a `.nox/baseline.json` entry written against the retired ID keeps matching;
+- an OpenVEX statement naming it — by ID or by `_nox_fingerprint` — still applies;
+- a `# nox:ignore <retired-id>` comment still suppresses;
+- `scan.rules.disable: [<retired-id>]` still switches the condition off.
+
+The alias is bounded by the retired rule's own pattern, so it only ever covers
+the lines that rule actually matched. It never widens a waiver to a condition
+the retired ID never reported.
+
+What does change is the count: one finding per condition instead of two, under
+the surviving ID and at that rule's severity. If you gate or report on a retired
+ID specifically, switch to the surviving one.
+
+| Retired | Now reported as | Condition |
+|---------|-----------------|-----------|
+| IAC-237 | IAC-007 | `privileged: true` |
+| IAC-283 | IAC-036 | `publicly_accessible = true` |
+| IAC-287 | IAC-030 | `automountServiceAccountToken: true` |
+| IAC-291 | IAC-026 | `hostPID: true` |
+| IAC-292 | IAC-027 | `hostIPC: true` |
+| IAC-310 | IAC-018 | `continue-on-error: true` |
+| IAC-312 | IAC-017 | deprecated `::set-output` |
+| IAC-321 | IAC-042 | `enable_https_traffic_only = false` |
+| IAC-333 | IAC-111 | `enable_secure_boot = false` |
+| IAC-337 | IAC-116 | `require_ssl = false` |
+
+IAC-065 (CloudFormation ECS task definition) is a partial case: it still reports
+`User: 0` / `User: root`, while the `Privileged: true` half it shared with
+IAC-007 is now reported by IAC-007 alone.
 
 ### Secrets Rules (938 rules)
 
@@ -1457,7 +2053,7 @@ IaC rules detect security misconfigurations in container definitions, cloud infr
 
 | Rule | Severity | Confidence | CWE | Description |
 |------|----------|------------|-----|-------------|
-| IAC-007 | Critical | High | CWE-250 | Kubernetes pod running as privileged |
+| IAC-007 | Critical | High | CWE-250 | Container runs in privileged mode |
 | IAC-008 | High | High | CWE-284 | Kubernetes pod uses host network |
 | IAC-009 | Critical | High | CWE-250 | Kubernetes pod allows privilege escalation |
 | IAC-010 | High | High | CWE-250 | Kubernetes pod running as root (runAsUser: 0) |

@@ -81,9 +81,30 @@ func (r *ClassifierRegistry) Classify(path string, info os.FileInfo) ArtifactTyp
 // DefaultClassifier classifies files by extension and well-known names.
 type DefaultClassifier struct{}
 
+// LockfileNames returns the set of filenames that discovery classifies as
+// dependency lockfiles.
+//
+// Exported so the dependency analyzer can assert that every classified
+// lockfile is either parsed or explicitly known to be redundant. Adding a name
+// here without a parser creates a silent blind spot — a project of that
+// ecosystem scans clean while nothing was read — which is exactly what
+// happened to yarn, pnpm and poetry.
+func LockfileNames() []string {
+	out := make([]string, 0, len(lockfileNames))
+	for name := range lockfileNames {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // lockfileNames contains exact file names that identify lockfiles.
 var lockfileNames = map[string]bool{
-	"package-lock.json":  true,
+	"package-lock.json": true,
+	// go.mod is the Go dependency source (selected versions). go.sum stays
+	// classified so it is kept out of the content rule families, but the deps
+	// analyzer no longer parses it — see deps.parseGoMod.
+	"go.mod":             true,
 	"go.sum":             true,
 	"yarn.lock":          true,
 	"poetry.lock":        true,
@@ -109,18 +130,81 @@ var containerNames = map[string]bool{
 
 // sourceExtensions maps file extensions to the Source artifact type.
 var sourceExtensions = map[string]bool{
-	".go":   true,
-	".py":   true,
-	".js":   true,
-	".ts":   true,
-	".rb":   true,
-	".java": true,
-	".rs":   true,
-	".c":    true,
-	".cpp":  true,
-	".h":    true,
-	".cs":   true,
-	".sh":   true,
+	".go": true,
+	".py": true,
+	// JavaScript / TypeScript and their module + JSX variants. The React/Next
+	// AI-app frontend keeps its LLM calls and prompt construction in .tsx/.jsx,
+	// so omitting them left that code unclassified (and unscanned by
+	// source-gated rules).
+	".js": true, ".jsx": true, ".mjs": true, ".cjs": true,
+	".ts": true, ".tsx": true, ".mts": true, ".cts": true,
+	".rb":    true,
+	".java":  true,
+	".kt":    true,
+	".swift": true,
+	".php":   true,
+	".rs":    true,
+	// C and C++ dialect extensions (translation units and headers). One taint
+	// module (lexctx scan_cpp + engine extract_cpp + catalog `cpp` block) serves
+	// every dialect since they share lexing and dangerous-API surface.
+	".c": true, ".h": true,
+	".cpp": true, ".cc": true, ".cxx": true, ".c++": true,
+	".hpp": true, ".hh": true, ".hxx": true, ".ipp": true, ".inl": true,
+	".cs": true,
+	".sh": true,
+	// Perl translation units, modules, CGI scripts, and test scripts. One taint
+	// module (lexctx scan_perl + engine extract_perl + catalog `perl` block).
+	".pl": true, ".pm": true, ".cgi": true, ".t": true,
+	".scala": true,
+	".sc":    true,
+	// Objective-C / Objective-C++ translation units. Headers (.h/.hh/.hpp) are
+	// already covered by the C/C++ set above and stay under that lexer; only the
+	// implementation files carry the objc taint module (lexctx scan_objc + engine
+	// extract_objc + the catalog `objc` block).
+	".m":    true,
+	".mm":   true,
+	".ps1":  true,
+	".psm1": true,
+	".psd1": true,
+	// Lua translation units. One taint module (lexctx scan_lua + engine
+	// extract_lua + catalog `lua` block) serves scripts, OpenResty handlers, and
+	// embedded config.
+	".lua":  true,
+	".dart": true,
+	// Elixir source (.ex) and script (.exs) files. One taint module (lexctx
+	// scan_elixir + engine extract_elixir + the catalog `elixir` block).
+	".ex":  true,
+	".exs": true,
+	// Clojure source and ClojureScript / cross-platform variants. One taint
+	// module (lexctx scan_clojure + engine extract_clojure + catalog `clojure`).
+	".clj":  true,
+	".cljs": true,
+	".cljc": true,
+	// Groovy source and Gradle build scripts (lexctx scan_groovy + engine
+	// extract_groovy + catalog `groovy`). The extension-less Jenkinsfile is
+	// classified by exact name via sourceNames below.
+	".groovy": true,
+	".gradle": true,
+	// Extensions the lexer supports that were missing here, so files it can
+	// fully analyse were not being classified as Source (and were skipped by
+	// source-gated rules): Kotlin script, Ruby gemspec/rake, PHP templates,
+	// Python stubs/interfaces, Clojure EDN, and .bash. A parity test against
+	// lexctx.SourceExtensions now fails if this set falls behind the lexer again.
+	".kts":     true,
+	".gemspec": true,
+	".rake":    true,
+	".phtml":   true,
+	".pyi":     true,
+	".pyw":     true,
+	".edn":     true,
+	".bash":    true,
+}
+
+// sourceNames contains exact, extension-less file names that carry source code.
+// A Jenkins pipeline lives in a `Jenkinsfile` (Groovy) with no extension, so an
+// extension-only lookup misses it; Classify consults this by base name.
+var sourceNames = map[string]bool{
+	"Jenkinsfile": true,
 }
 
 // configExtensions maps file extensions to the Config artifact type.
@@ -172,6 +256,11 @@ func (d *DefaultClassifier) Classify(path string, _ os.FileInfo) ArtifactType {
 		return Config
 	}
 
+	// Source by exact name (extension-less source files, e.g. Jenkinsfile).
+	if sourceNames[name] {
+		return Source
+	}
+
 	// Source by extension.
 	if sourceExtensions[ext] {
 		return Source
@@ -184,7 +273,10 @@ func (d *DefaultClassifier) Classify(path string, _ os.FileInfo) ArtifactType {
 // patterns: mcp.json, *.prompt, *.prompt.md, or paths containing /prompts/
 // or /agents/ segments.
 func isAIComponent(name, normalised string) bool {
-	if name == "mcp.json" {
+	if mcpConfigNames[name] {
+		return true
+	}
+	if strings.HasSuffix(name, ".mcp.json") {
 		return true
 	}
 	if strings.HasSuffix(name, ".prompt") {
@@ -193,7 +285,48 @@ func isAIComponent(name, normalised string) bool {
 	if strings.HasSuffix(name, ".prompt.md") {
 		return true
 	}
-	if containsSegment(normalised, "prompts") || containsSegment(normalised, "agents") {
+	// The prompts/ and agents/ directory heuristic is a weak, path-only signal.
+	// It must NOT claim files that are recognised source code: a .go/.ts/.py
+	// living under a prompts/ or agents/ directory is exactly the LLM-prompt and
+	// agent-driving code that most needs SAST, taint, and agentflow analysis —
+	// all of which skip any artifact whose Type is not Source, so misclassifying
+	// it as AIComponent silently drops it from those scans. The specific AI
+	// signals above (mcp.json, *.prompt, and the agent-config names below) stay
+	// authoritative; only this broad segment test yields to source. Such files
+	// are still enriched by the AI analyzer when their content carries AI SDK
+	// markers (see ai.ScanArtifacts's isSourceFile && isLikelyAIContent path).
+	if !sourceExtensions[filepath.Ext(name)] && !sourceNames[name] &&
+		(containsSegment(normalised, "prompts") || containsSegment(normalised, "agents")) {
+		return true
+	}
+	if isAgentConfig(name, normalised) {
+		return true
+	}
+	return false
+}
+
+// agentConfigNames are the fixed-name files that steer a coding agent — its
+// rules, manifest, skills, and permission settings. They are an execution
+// surface (a poisoned rule or an over-broad permission grant changes what the
+// agent runs), so nox treats them as AI components and scans them (AGENT-*).
+var agentConfigNames = map[string]bool{
+	".cursorrules": true, ".clinerules": true, ".windsurfrules": true,
+	"CLAUDE.md": true, "AGENTS.md": true, "GEMINI.md": true,
+	"SKILL.md": true, "skill.md": true, "copilot-instructions.md": true,
+}
+
+// isAgentConfig reports whether a file is an agent-configuration artifact: a
+// fixed-name rules/manifest/skill file, a Cursor `.mdc` rule, or a settings
+// file living under a `.claude` or `.cursor` directory.
+func isAgentConfig(name, normalised string) bool {
+	if agentConfigNames[name] {
+		return true
+	}
+	if strings.HasSuffix(name, ".mdc") {
+		return true
+	}
+	if (name == "settings.json" || name == "settings.local.json") &&
+		(containsSegment(normalised, ".claude") || containsSegment(normalised, ".cursor")) {
 		return true
 	}
 	return false
@@ -205,6 +338,44 @@ func containsSegment(path, segment string) bool {
 	parts := strings.Split(path, "/")
 	for _, p := range parts {
 		if p == segment {
+			return true
+		}
+	}
+	return false
+}
+
+// dirContainsAnyIncluded reports whether any path in the include-set is
+// at or under the given directory (relative, slash-separated). Used to
+// short-circuit `filepath.Walk` descent when --changed-since restricts
+// the scan to a small set of files. The root directory ("") is treated
+// as containing every path so the walk always enters at least once.
+func dirContainsAnyIncluded(relDir string, include map[string]bool) bool {
+	if relDir == "" || relDir == "." {
+		return len(include) > 0
+	}
+	prefix := relDir + "/"
+	for p := range include {
+		if p == relDir || strings.HasPrefix(p, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// dirContainsAnyTracked reports whether any tracked path is at or under the
+// given directory (relative, slash-separated). Used to keep the walker from
+// pruning an ignored directory that still holds git-tracked files. The root
+// ("" / ".") contains every tracked path.
+func dirContainsAnyTracked(relDir string, tracked map[string]bool) bool {
+	if len(tracked) == 0 {
+		return false
+	}
+	if relDir == "" || relDir == "." {
+		return true
+	}
+	prefix := relDir + "/"
+	for p := range tracked {
+		if p == relDir || strings.HasPrefix(p, prefix) {
 			return true
 		}
 	}
@@ -224,6 +395,68 @@ type Walker struct {
 	// root patterns are applied during traversal. When false, every file
 	// in the tree is walked regardless of ignore rules. Defaults to true.
 	RespectGitignore bool
+	// IncludePaths, when non-empty, restricts the walk to files whose
+	// path (relative to Root, slash-separated) appears in the set. Used
+	// by --changed-since to avoid walking unchanged subtrees. The walker
+	// also short-circuits directory descent when no included path lives
+	// under the current directory.
+	IncludePaths map[string]bool
+	// TrackedPaths holds the files git tracks (relative to Root, slash-
+	// separated). git never ignores a tracked file, so a path in this set
+	// is scanned even when a .gitignore pattern matches it — and an ignored
+	// directory is still descended into when it contains a tracked file.
+	// Empty (the default) means "no git context", so ignore rules apply as
+	// before.
+	TrackedPaths map[string]bool
+	// ExcludePatterns are hard, explicit exclusions (from `scan.exclude` in
+	// config): paths the user has said to never scan. Unlike gitignore
+	// patterns, these are NOT overridden by TrackedPaths — a tracked file that
+	// matches an exclude is still skipped, because the user asked for it
+	// (e.g. a rule-definition file full of expected-false-positive patterns).
+	ExcludePatterns []string
+	// IncludePatterns, when non-empty, restricts the scan to files matching at
+	// least one pattern (from `scan.include` in config). It is the glob-based
+	// counterpart to IncludePaths, which holds exact paths for --changed-since;
+	// when both are set a file must satisfy both.
+	//
+	// ExcludePatterns still wins: an operator who writes both means the
+	// intersection, and exclude is the explicit "never scan this".
+	//
+	// Directories are still descended. A glob says nothing reliable about
+	// whether a subtree can contain a match — "src/**/*.go" cannot tell you in
+	// advance about src/a/b/ — and pruning on that guess silently loses files,
+	// which is the failure this setting was reported for. Pruning a subtree out
+	// of the walk is what ExcludePatterns is for.
+	IncludePatterns []string
+}
+
+// MatchesInclude reports whether a file is allowed by an include pattern. It is
+// exported so plugin findings are scoped by the same matcher the walk uses —
+// "in scope" must mean one thing regardless of which analyzer found the issue.
+func MatchesInclude(relSlash string, patterns []string) bool {
+	return matchesInclude(relSlash, patterns)
+}
+
+// matchesInclude reports whether a file is allowed by an include pattern.
+//
+// The path itself is tested, and so is each of its ancestor directories. That
+// is what makes "src" , "src/" and "src/**" all mean "everything under src",
+// which is what an operator writing an allow-list means by any of them. Testing
+// only the full path makes the three behave differently for no reason a reader
+// could predict, and the difference shows up as quietly missing coverage.
+func matchesInclude(relSlash string, patterns []string) bool {
+	if IsIgnored(relSlash, patterns) {
+		return true
+	}
+	for i := 0; i < len(relSlash); i++ {
+		if relSlash[i] != '/' {
+			continue
+		}
+		if IsIgnored(relSlash[:i], patterns) {
+			return true
+		}
+	}
+	return false
 }
 
 // NewWalker creates a Walker rooted at root with the DefaultClassifier
@@ -280,6 +513,25 @@ func (w *Walker) Walk() ([]Artifact, error) {
 			return filepath.SkipDir
 		}
 
+		// Hard config excludes (scan.exclude) win unconditionally — they are
+		// explicit "never scan this" rules, so the tracked-file override that
+		// applies to .gitignore does NOT apply here. Checked before gitignore
+		// and before IncludePaths so it holds even under --changed-since.
+		if len(w.ExcludePatterns) > 0 && IsIgnored(filepath.ToSlash(rel), w.ExcludePatterns) {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		// Config include allow-list (scan.include). Applied to files only, after
+		// the hard excludes so exclude keeps winning.
+		if len(w.IncludePatterns) > 0 && !info.IsDir() {
+			if !matchesInclude(filepath.ToSlash(rel), w.IncludePatterns) {
+				return nil
+			}
+		}
+
 		if w.RespectGitignore {
 			if info.IsDir() && path != absRoot {
 				if pats, _ := LoadNestedGitignore(path); len(pats) > 0 {
@@ -288,9 +540,33 @@ func (w *Walker) Walk() ([]Artifact, error) {
 			}
 
 			if w.isIgnored(absRoot, path, rel, nestedPatterns) {
+				relSlash := filepath.ToSlash(rel)
 				if info.IsDir() {
+					// Prune an ignored directory — unless it holds a tracked
+					// file. git never ignores a tracked file, so we must
+					// descend to reach one (e.g. a repo that .gitignores
+					// `mobile/` but commits sources into it).
+					if !dirContainsAnyTracked(relSlash, w.TrackedPaths) {
+						return filepath.SkipDir
+					}
+				} else if !w.TrackedPaths[relSlash] {
+					// Skip an ignored file unless it is tracked.
+					return nil
+				}
+			}
+		}
+
+		// IncludePaths short-circuit: when an allow-list is supplied
+		// (e.g. via --changed-since), skip dirs that don't contain any
+		// included path and skip files not in the set. This avoids
+		// walking unchanged subtrees in large monorepos.
+		if len(w.IncludePaths) > 0 {
+			relSlash := filepath.ToSlash(rel)
+			if info.IsDir() {
+				if !dirContainsAnyIncluded(relSlash, w.IncludePaths) {
 					return filepath.SkipDir
 				}
+			} else if !w.IncludePaths[relSlash] {
 				return nil
 			}
 		}

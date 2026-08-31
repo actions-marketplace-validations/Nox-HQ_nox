@@ -4,14 +4,15 @@
 package sbom
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/nox-hq/nox/core/analyzers/deps"
+	"github.com/nox-hq/nox/core/report"
 )
 
 // ---------------------------------------------------------------------------
@@ -138,9 +139,7 @@ func (r *CycloneDXReporter) Generate(inventory *deps.PackageInventory) ([]byte, 
 			PURL:    buildPURL(ip.pkg),
 		}
 		if ip.pkg.License != "" {
-			comp.Licenses = []CDXLicenseWrapper{
-				{License: CDXLicense{ID: ip.pkg.License}},
-			}
+			comp.Licenses = []CDXLicenseWrapper{{License: cdxLicenseFor(ip.pkg.License)}}
 		}
 		components = append(components, comp)
 	}
@@ -161,7 +160,16 @@ func (r *CycloneDXReporter) Generate(inventory *deps.PackageInventory) ([]byte, 
 			}
 		}
 		sort.Slice(entries, func(i, j int) bool {
-			return entries[i].vuln.ID < entries[j].vuln.ID
+			// Sort by vuln.ID first, then by the package's original index as a
+			// deterministic tie-breaker. Entries are collected by ranging a map
+			// (randomized order in Go), so when one CVE affects several packages
+			// its entries share an equal vuln.ID; without this tie-breaker their
+			// relative order would vary run to run, breaking nox's byte-identical
+			// output guarantee.
+			if entries[i].vuln.ID != entries[j].vuln.ID {
+				return entries[i].vuln.ID < entries[j].vuln.ID
+			}
+			return entries[i].origIdx < entries[j].origIdx
 		})
 
 		for _, e := range entries {
@@ -185,13 +193,13 @@ func (r *CycloneDXReporter) Generate(inventory *deps.PackageInventory) ([]byte, 
 		}
 	}
 
-	report := CDXReport{
+	doc := CDXReport{
 		BOMFormat:    "CycloneDX",
 		SpecVersion:  "1.5",
-		SerialNumber: "urn:uuid:nox-scan",
+		SerialNumber: deterministicSerialURN(components),
 		Version:      1,
 		Metadata: CDXMetadata{
-			Timestamp: time.Now().UTC().Format(time.RFC3339),
+			Timestamp: report.GeneratedAt(),
 			Tools: []CDXTool{
 				{
 					Vendor:  "nox",
@@ -204,7 +212,7 @@ func (r *CycloneDXReporter) Generate(inventory *deps.PackageInventory) ([]byte, 
 		Vulnerabilities: cdxVulns,
 	}
 
-	return json.MarshalIndent(report, "", "  ")
+	return json.MarshalIndent(doc, "", "  ")
 }
 
 // WriteToFile generates the CycloneDX report and writes it to the given path.
@@ -308,8 +316,14 @@ func (r *SPDXReporter) Generate(inventory *deps.PackageInventory) ([]byte, error
 		spdxID := fmt.Sprintf("SPDXRef-Package-%d", i)
 		purl := buildPURL(ip.pkg)
 
+		// SPDX 2.3 requires licenseDeclared to be a valid SPDX license
+		// expression, NOASSERTION, or NONE. Free-text like "Apache 2.0" (with a
+		// space) or "see LICENSE file" would produce a spec-invalid document, so
+		// only emit the license when it is a recognized SPDX identifier and fall
+		// back to NOASSERTION otherwise. This mirrors the CycloneDX path's use of
+		// the spdxLicenseIDs whitelist.
 		declaredLicense := "NOASSERTION"
-		if ip.pkg.License != "" {
+		if spdxLicenseIDs[ip.pkg.License] {
 			declaredLicense = ip.pkg.License
 		}
 
@@ -369,7 +383,7 @@ func (r *SPDXReporter) Generate(inventory *deps.PackageInventory) ([]byte, error
 		Name:              "nox-scan",
 		DocumentNamespace: "https://github.com/nox-hq/nox/scans",
 		CreationInfo: SPDXCreationInfo{
-			Created:  time.Now().UTC().Format(time.RFC3339),
+			Created:  report.GeneratedAt(),
 			Creators: []string{fmt.Sprintf("Tool: nox-%s", r.ToolVersion)},
 		},
 		Packages:      spdxPkgs,
@@ -417,4 +431,49 @@ func buildPURL(p deps.Package) string {
 		return fmt.Sprintf("pkg:%s/%s/%s@%s", purlType, parts[0], parts[1], p.Version)
 	}
 	return fmt.Sprintf("pkg:%s/%s@%s", purlType, p.Name, p.Version)
+}
+
+// deterministicSerialURN returns a valid RFC-4122 UUID URN derived from the
+// component set. CycloneDX constrains serialNumber to the UUID URN grammar, so
+// the previous constant "urn:uuid:nox-scan" failed schema validation on every
+// document. Deriving it from a content hash keeps nox's reproducible-output
+// guarantee — identical input yields an identical serial — while remaining a
+// well-formed, per-scan-unique UUID.
+func deterministicSerialURN(components []CDXComponent) string {
+	h := sha256.New()
+	for i := range components {
+		_, _ = fmt.Fprintf(h, "%s\x00%s\x00%s\n", components[i].Name, components[i].Version, components[i].PURL)
+	}
+	sum := h.Sum(nil)
+	// Format 16 bytes as a UUID, stamping the version (4) and variant (RFC 4122)
+	// nibbles so the result is a syntactically valid UUID.
+	var u [16]byte
+	copy(u[:], sum)
+	u[6] = (u[6] & 0x0f) | 0x40
+	u[8] = (u[8] & 0x3f) | 0x80
+	return fmt.Sprintf("urn:uuid:%x-%x-%x-%x-%x", u[0:4], u[4:6], u[6:8], u[8:10], u[10:16])
+}
+
+// spdxLicenseIDs is the set of SPDX identifiers common in real dependency
+// metadata. CycloneDX validates license.id against the SPDX enumeration, so an
+// arbitrary string there (e.g. "Apache 2.0" with a space, or proprietary text)
+// fails the schema. Anything not confirmed here goes into license.name, which
+// accepts free text — always schema-valid, if less precise.
+var spdxLicenseIDs = map[string]bool{
+	"MIT": true, "Apache-2.0": true, "BSD-2-Clause": true, "BSD-3-Clause": true,
+	"ISC": true, "MPL-2.0": true, "LGPL-2.1": true, "LGPL-2.1-only": true,
+	"LGPL-3.0": true, "LGPL-3.0-only": true, "GPL-2.0": true, "GPL-2.0-only": true,
+	"GPL-3.0": true, "GPL-3.0-only": true, "GPL-3.0-or-later": true,
+	"AGPL-3.0": true, "AGPL-3.0-only": true, "Unlicense": true, "0BSD": true,
+	"CC0-1.0": true, "CC-BY-4.0": true, "BSL-1.0": true, "Zlib": true,
+	"Artistic-2.0": true, "EPL-2.0": true, "WTFPL": true, "Python-2.0": true,
+}
+
+// cdxLicenseFor routes a license string to license.id (valid SPDX IDs only) or
+// license.name (everything else), keeping the CycloneDX document schema-valid.
+func cdxLicenseFor(license string) CDXLicense {
+	if spdxLicenseIDs[license] {
+		return CDXLicense{ID: license}
+	}
+	return CDXLicense{Name: license}
 }

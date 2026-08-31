@@ -1,6 +1,7 @@
 package findings
 
 import (
+	"strconv"
 	"testing"
 )
 
@@ -25,7 +26,12 @@ func TestComputeFingerprint_Determinism(t *testing.T) {
 }
 
 func TestComputeFingerprint_Uniqueness(t *testing.T) {
-	t.Parallel()
+	// This test covers the V1 uniqueness axes (rule_id, file_path, start_line,
+	// content). Under the default V2 algorithm start_line is intentionally NOT
+	// an axis (line-independence is the whole point — see
+	// TestFingerprintV2_LineIndependent), so pin V1 here. Not parallel: it
+	// mutates the package-global fingerprint version.
+	withFingerprintVersion(t, FingerprintV1)
 
 	loc := Location{
 		FilePath:  "cmd/server/main.go",
@@ -219,6 +225,186 @@ func TestFindingSet_Deduplicate(t *testing.T) {
 	}
 }
 
+// sinkAnchored builds a flow finding shaped like the built-in taint model's:
+// located at the sink, with no sink_line metadata.
+func sinkAnchored(rule, path string, sinkLine, sourceLine int, sourceVar string) Finding {
+	return Finding{
+		RuleID:   rule,
+		Location: Location{FilePath: path, StartLine: sinkLine},
+		Message:  "built-in: " + sourceVar + " reaches a sink",
+		Metadata: map[string]string{
+			"source_line": strconv.Itoa(sourceLine),
+			"source_var":  sourceVar,
+		},
+	}
+}
+
+// sourceAnchored builds a flow finding shaped like the taint-analysis plugin's:
+// located at the source, with the sink line carried in metadata.
+func sourceAnchored(rule, path string, sinkLine, sourceLine int, sourceVar string) Finding {
+	return Finding{
+		RuleID:   rule,
+		Location: Location{FilePath: path, StartLine: sourceLine},
+		Message:  "plugin: " + sourceVar + " flows to a sink",
+		Metadata: map[string]string{
+			"sink_line":   strconv.Itoa(sinkLine),
+			"source_line": strconv.Itoa(sourceLine),
+			"source_var":  sourceVar,
+		},
+	}
+}
+
+func TestFindingSet_DeduplicateFlows_CollapsesToSinkAnchor(t *testing.T) {
+	t.Parallel()
+
+	for _, order := range []string{"builtin-first", "plugin-first"} {
+		t.Run(order, func(t *testing.T) {
+			t.Parallel()
+			builtin := sinkAnchored("TAINT-001", "sqli.go", 12, 11, "q")
+			plugin := sourceAnchored("TAINT-001", "./sqli.go", 12, 11, "q")
+
+			fs := NewFindingSet()
+			if order == "builtin-first" {
+				fs.Add(builtin)
+				fs.Add(plugin)
+			} else {
+				fs.Add(plugin)
+				fs.Add(builtin)
+			}
+			fs.DeduplicateFlows()
+
+			got := fs.Findings()
+			if len(got) != 1 {
+				t.Fatalf("one flow reported from both ends must collapse to 1 finding, got %d", len(got))
+			}
+			// The sink anchor wins regardless of which analyzer reported first:
+			// the result must not depend on analyzer ordering.
+			if got[0].Location.StartLine != 12 {
+				t.Fatalf("kept the finding at line %d, want the sink line 12", got[0].Location.StartLine)
+			}
+		})
+	}
+}
+
+func TestFindingSet_DeduplicateFlows_KeepsDistinctFlows(t *testing.T) {
+	t.Parallel()
+
+	fs := NewFindingSet()
+	// Same rule and file, but a different variable, a different source line and
+	// a different sink line: three genuinely distinct vulnerabilities.
+	fs.Add(sinkAnchored("TAINT-001", "app.go", 12, 11, "q"))
+	fs.Add(sourceAnchored("TAINT-001", "app.go", 12, 11, "other"))
+	fs.Add(sourceAnchored("TAINT-001", "app.go", 12, 9, "q"))
+	fs.Add(sourceAnchored("TAINT-001", "app.go", 40, 11, "q"))
+
+	fs.DeduplicateFlows()
+
+	if len(fs.Findings()) != 4 {
+		t.Fatalf("distinct flows must all survive, got %d of 4", len(fs.Findings()))
+	}
+}
+
+func TestFindingSet_DeduplicateFlows_IgnoresNonFlowFindings(t *testing.T) {
+	t.Parallel()
+
+	fs := NewFindingSet()
+	// No flow metadata at all: two secrets on the same line of the same file
+	// under one rule are not a flow and must never be collapsed by this pass.
+	fs.Add(Finding{RuleID: "SEC-001", Location: Location{FilePath: "a.go", StartLine: 3}, Message: "aws key"})
+	fs.Add(Finding{RuleID: "SEC-001", Location: Location{FilePath: "a.go", StartLine: 3}, Message: "gcp key"})
+	// Partial flow metadata is not enough to identify a flow either.
+	fs.Add(Finding{
+		RuleID:   "TAINT-001",
+		Location: Location{FilePath: "a.go", StartLine: 12},
+		Message:  "no source var",
+		Metadata: map[string]string{"source_line": "11"},
+	})
+	fs.Add(Finding{
+		RuleID:   "TAINT-001",
+		Location: Location{FilePath: "a.go", StartLine: 12},
+		Message:  "no source line",
+		Metadata: map[string]string{"source_var": "q"},
+	})
+
+	fs.DeduplicateFlows()
+
+	if len(fs.Findings()) != 4 {
+		t.Fatalf("findings without flow identity must be untouched, got %d of 4", len(fs.Findings()))
+	}
+}
+
+func TestFindingSet_SuppressDuplicateVulnClass(t *testing.T) {
+	t.Parallel()
+
+	fs := NewFindingSet()
+	// A variants SSTI CVE signature and a taint SSTI sink both fire on the same
+	// render_template_string line — the same vulnerability reported twice.
+	fs.Add(Finding{
+		RuleID:   "VARIANT-005",
+		Location: Location{FilePath: "app.py", StartLine: 9},
+		Message:  "SSTI variant",
+		Metadata: map[string]string{"vuln_class": "ssti"},
+	})
+	fs.Add(Finding{
+		RuleID:   "TAINT-003",
+		Location: Location{FilePath: "app.py", StartLine: 9},
+		Message:  "taint SSTI",
+		Metadata: map[string]string{"vuln_class": "ssti"},
+	})
+
+	fs.SuppressDuplicateVulnClass("TAINT-")
+
+	got := fs.Findings()
+	if len(got) != 1 {
+		t.Fatalf("expected 1 finding after cross-analyzer SSTI dedup, got %d", len(got))
+	}
+	if got[0].RuleID != "VARIANT-005" {
+		t.Fatalf("expected the specific VARIANT-005 signature kept, got %q", got[0].RuleID)
+	}
+}
+
+func TestFindingSet_SuppressDuplicateVulnClass_KeepsDistinctClass(t *testing.T) {
+	t.Parallel()
+
+	fs := NewFindingSet()
+	// A taint XSS finding co-located with a variants SSTI finding must be kept:
+	// different vuln classes are different vulnerabilities.
+	fs.Add(Finding{
+		RuleID:   "VARIANT-005",
+		Location: Location{FilePath: "app.py", StartLine: 9},
+		Metadata: map[string]string{"vuln_class": "ssti"},
+	})
+	fs.Add(Finding{
+		RuleID:   "TAINT-003",
+		Location: Location{FilePath: "app.py", StartLine: 9},
+		Metadata: map[string]string{"vuln_class": "xss"},
+	})
+
+	fs.SuppressDuplicateVulnClass("TAINT-")
+
+	if len(fs.Findings()) != 2 {
+		t.Fatalf("distinct vuln classes at one span must both survive, got %d", len(fs.Findings()))
+	}
+}
+
+func TestFindingSet_SuppressDuplicateVulnClass_KeepsLoneTaint(t *testing.T) {
+	t.Parallel()
+
+	fs := NewFindingSet()
+	// A taint SSTI finding with no other analyzer covering it must be kept.
+	fs.Add(Finding{
+		RuleID:   "TAINT-003",
+		Location: Location{FilePath: "app.py", StartLine: 9},
+		Metadata: map[string]string{"vuln_class": "ssti"},
+	})
+
+	fs.SuppressDuplicateVulnClass("TAINT-")
+
+	if len(fs.Findings()) != 1 {
+		t.Fatalf("a lone taint finding must survive, got %d", len(fs.Findings()))
+	}
+}
+
 func TestFindingSet_Deduplicate_KeepsFirst(t *testing.T) {
 	t.Parallel()
 
@@ -381,6 +567,36 @@ func TestFindingSet_RemoveByRuleIDs(t *testing.T) {
 		if f.RuleID == "AI-008" {
 			t.Errorf("found AI-008 finding that should have been removed")
 		}
+	}
+}
+
+// Regression: analyzer_rules rule IDs may be wildcards (e.g. "VULN-*").
+// Previously RemoveByRuleIDsAndPaths did an exact map lookup so wildcards
+// never matched.
+func TestFindingSet_RemoveByRuleIDsAndPaths_Wildcard(t *testing.T) {
+	t.Parallel()
+
+	fs := NewFindingSet()
+	fs.Add(Finding{RuleID: "VULN-001", Location: Location{FilePath: "vendor/x.go", StartLine: 1}, Message: "a"})
+	fs.Add(Finding{RuleID: "VULN-042", Location: Location{FilePath: "vendor/y.go", StartLine: 2}, Message: "b"})
+	fs.Add(Finding{RuleID: "VULN-001", Location: Location{FilePath: "src/main.go", StartLine: 3}, Message: "c"})
+	fs.Add(Finding{RuleID: "SEC-001", Location: Location{FilePath: "vendor/z.go", StartLine: 4}, Message: "d"})
+
+	// Remove all VULN-* findings under vendor/, leaving the src VULN and the SEC.
+	fs.RemoveByRuleIDsAndPaths([]string{"VULN-*"}, []string{"vendor/*"})
+
+	got := fs.Findings()
+	if len(got) != 2 {
+		t.Fatalf("expected 2 findings after wildcard removal, got %d: %+v", len(got), got)
+	}
+	for _, f := range got {
+		if f.RuleID == "VULN-001" && f.Location.FilePath == "src/main.go" {
+			continue
+		}
+		if f.RuleID == "SEC-001" {
+			continue
+		}
+		t.Errorf("unexpected surviving finding %s @ %s", f.RuleID, f.Location.FilePath)
 	}
 }
 
@@ -838,5 +1054,347 @@ func TestMatchRulePatterns(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("matchRulePatterns(%q, %v) = %v, want %v", tt.ruleID, tt.patterns, got, tt.want)
 		}
+	}
+}
+
+func TestRemoveByRuleIDsInDirs(t *testing.T) {
+	t.Parallel()
+	fs := NewFindingSet()
+	fs.Add(Finding{RuleID: "AI-006", Location: Location{FilePath: "tests/foo_test.py", StartLine: 1}, Message: "a"})
+	fs.Add(Finding{RuleID: "MCP-011", Location: Location{FilePath: "internal/fixtures/x.go", StartLine: 1}, Message: "b"})
+	fs.Add(Finding{RuleID: "AI-006", Location: Location{FilePath: "src/app.go", StartLine: 1}, Message: "c"})
+	fs.Add(Finding{RuleID: "VULN-001", Location: Location{FilePath: "tests/dep.go", StartLine: 1}, Message: "d"})
+
+	fs.RemoveByRuleIDsInDirs([]string{"AI-*", "MCP-*"}, []string{"tests", "fixtures"})
+
+	kept := map[string]bool{}
+	for _, f := range fs.Findings() {
+		kept[f.RuleID+"@"+f.Location.FilePath] = true
+	}
+	if kept["AI-006@tests/foo_test.py"] || kept["MCP-011@internal/fixtures/x.go"] {
+		t.Error("content-rule findings in test/fixture dirs should be removed")
+	}
+	if !kept["AI-006@src/app.go"] {
+		t.Error("content-rule finding in src must be kept")
+	}
+	if !kept["VULN-001@tests/dep.go"] {
+		t.Error("non-content-rule (VULN) finding in tests must be kept")
+	}
+}
+
+func TestSeverityConfidence_IsValid(t *testing.T) {
+	t.Parallel()
+	if !SeverityHigh.IsValid() || !ConfidenceLow.IsValid() {
+		t.Error("defined severity/confidence must be valid")
+	}
+	if Severity("bogus").IsValid() || Confidence("").IsValid() {
+		t.Error("undefined severity/confidence must be invalid")
+	}
+}
+
+func TestLocation_Normalized(t *testing.T) {
+	t.Parallel()
+	if got := (Location{StartLine: 5}).Normalized(); got.EndLine != 5 {
+		t.Errorf("zero EndLine should default to StartLine, got %d", got.EndLine)
+	}
+	if got := (Location{StartLine: 5, EndLine: 2}).Normalized(); got.EndLine != 5 {
+		t.Errorf("out-of-order EndLine should clamp to StartLine, got %d", got.EndLine)
+	}
+	if got := (Location{StartLine: 5, EndLine: 9}).Normalized(); got.EndLine != 9 {
+		t.Errorf("valid range must be preserved, got %d", got.EndLine)
+	}
+}
+
+func TestNewFinding_AndValidate(t *testing.T) {
+	t.Parallel()
+	f := NewFinding("SEC-001", SeverityHigh, ConfidenceMedium, Location{FilePath: "a.go", StartLine: 3}, "secret")
+	if f.Location.EndLine != 3 {
+		t.Errorf("NewFinding should normalize location, got EndLine=%d", f.Location.EndLine)
+	}
+	if err := f.Validate(); err != nil {
+		t.Errorf("well-formed finding should validate, got %v", err)
+	}
+	if (Finding{Severity: SeverityHigh, Confidence: ConfidenceLow}).Validate() == nil {
+		t.Error("empty RuleID must fail validation")
+	}
+	if (Finding{RuleID: "X", Severity: "bogus", Confidence: ConfidenceLow}).Validate() == nil {
+		t.Error("invalid severity must fail validation")
+	}
+}
+
+// TestSortByPriority orders the most actionable findings first: severity, then
+// reachability (confirmed-reachable up, likely-false-positive unreachable
+// down), then confidence, with a stable location tiebreak.
+func TestSortByPriority(t *testing.T) {
+	fs := NewFindingSet()
+	mk := func(id string, sev Severity, reachable string) Finding {
+		f := Finding{RuleID: id, Severity: sev, Confidence: ConfidenceHigh, Status: StatusNew,
+			Location: Location{FilePath: "a.go", StartLine: 1}, Message: id}
+		if reachable != "" {
+			f.Metadata = map[string]string{"reachable": reachable}
+		}
+		return f
+	}
+	// Added out of priority order on purpose.
+	fs.Add(mk("VULN-low", SeverityLow, ""))
+	fs.Add(mk("VULN-crit-unreach", SeverityCritical, "false"))
+	fs.Add(mk("VULN-crit-reach", SeverityCritical, "true"))
+	fs.Add(mk("VULN-high", SeverityHigh, ""))
+
+	fs.SortByPriority()
+	got := make([]string, 0, 4)
+	for _, f := range fs.Findings() {
+		got = append(got, f.RuleID)
+	}
+	want := []string{"VULN-crit-reach", "VULN-crit-unreach", "VULN-high", "VULN-low"}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("priority order = %v, want %v", got, want)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Context-gated downgrade tests
+// ---------------------------------------------------------------------------
+
+func TestSeverity_Downgraded(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		in   Severity
+		want Severity
+	}{
+		{SeverityCritical, SeverityHigh},
+		{SeverityHigh, SeverityMedium},
+		{SeverityMedium, SeverityLow},
+		{SeverityLow, SeverityInfo},
+		{SeverityInfo, SeverityInfo},           // info is the floor (idempotent)
+		{Severity("bogus"), Severity("bogus")}, // unknown passes through unchanged
+	}
+	for _, tc := range cases {
+		if got := tc.in.Downgraded(); got != tc.want {
+			t.Errorf("Severity(%q).Downgraded() = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestDowngradeByRulePatternsAndPath_DowngradesAndRecords(t *testing.T) {
+	t.Parallel()
+
+	fs := NewFindingSet()
+	fs.Add(Finding{RuleID: "AI-002", Severity: SeverityHigh, Location: Location{FilePath: "examples/foo.py", StartLine: 1}, Message: "prompt boundary"})
+
+	inExamples := func(p string) bool { return p == "examples/foo.py" }
+	n := fs.DowngradeByRulePatternsAndPath([]string{"AI-*"}, inExamples, "non-production")
+	if n != 1 {
+		t.Fatalf("downgraded count = %d, want 1", n)
+	}
+
+	f := fs.Findings()[0]
+	if f.Severity != SeverityMedium {
+		t.Errorf("severity = %q, want medium (high downgraded one level)", f.Severity)
+	}
+	if f.Metadata["original_severity"] != "high" {
+		t.Errorf("original_severity = %q, want high", f.Metadata["original_severity"])
+	}
+	if f.Metadata["context"] != "non-production" {
+		t.Errorf("context = %q, want non-production", f.Metadata["context"])
+	}
+}
+
+func TestDowngradeByRulePatternsAndPath_SkipsNonMatching(t *testing.T) {
+	t.Parallel()
+
+	fs := NewFindingSet()
+	// Production path — must not downgrade.
+	fs.Add(Finding{RuleID: "AI-002", Severity: SeverityHigh, Location: Location{FilePath: "src/foo.py", StartLine: 1}, Message: "prod"})
+	// Out-of-scope family in a non-production path — must not downgrade.
+	fs.Add(Finding{RuleID: "SEC-001", Severity: SeverityCritical, Location: Location{FilePath: "tests/foo.py", StartLine: 1}, Message: "secret"})
+
+	always := func(string) bool { return true }
+	inTests := func(p string) bool { return p == "tests/foo.py" }
+
+	if n := fs.DowngradeByRulePatternsAndPath(ContextRuleScopeFixture(), inTests, "non-production"); n != 0 {
+		t.Fatalf("SEC-001 should be out of scope, downgraded %d", n)
+	}
+	// AI-002 in src is in-scope by family but not by path.
+	if n := fs.DowngradeByRulePatternsAndPath([]string{"AI-*"}, func(p string) bool { return p == "examples/x" }, "non-production"); n != 0 {
+		t.Fatalf("AI-002 in src should not match path, downgraded %d", n)
+	}
+	// Sanity: with an always-true matcher AI-002 downgrades but SEC-001 stays out of scope.
+	if n := fs.DowngradeByRulePatternsAndPath([]string{"AI-*"}, always, "non-production"); n != 1 {
+		t.Fatalf("AI-002 should downgrade exactly once, got %d", n)
+	}
+	for _, f := range fs.Findings() {
+		if f.RuleID == "SEC-001" && f.Severity != SeverityCritical {
+			t.Errorf("SEC-001 must remain critical, got %q", f.Severity)
+		}
+	}
+}
+
+func TestDowngradeByRulePatternsAndPath_Idempotent(t *testing.T) {
+	t.Parallel()
+
+	fs := NewFindingSet()
+	fs.Add(Finding{RuleID: "IAC-010", Severity: SeverityCritical, Location: Location{FilePath: "test/main.tf", StartLine: 1}, Message: "iac"})
+
+	always := func(string) bool { return true }
+	first := fs.DowngradeByRulePatternsAndPath([]string{"IAC-*"}, always, "non-production")
+	second := fs.DowngradeByRulePatternsAndPath([]string{"IAC-*"}, always, "non-production")
+	if first != 1 || second != 0 {
+		t.Fatalf("expected first=1 second=0 (idempotent), got first=%d second=%d", first, second)
+	}
+	f := fs.Findings()[0]
+	if f.Severity != SeverityHigh {
+		t.Errorf("severity = %q, want high (single downgrade only)", f.Severity)
+	}
+	if f.Metadata["original_severity"] != "critical" {
+		t.Errorf("original_severity = %q, want critical (unchanged by second pass)", f.Metadata["original_severity"])
+	}
+}
+
+// ContextRuleScopeFixture returns the in-scope code-pattern families for the
+// downgrade, mirroring core.ContextDowngradeRulePatterns without importing the
+// core package (findings must not depend on core). SEC-* is deliberately absent.
+func ContextRuleScopeFixture() []string {
+	return []string{"AI-*", "MCP-*", "AGENT-*", "IAC-*", "TAINT-*", "SLOP-*", "VARIANT-*"}
+}
+
+// TestDeduplicate_KeepsDistinctFindingsAtDifferentLines is the regression test
+// for a silent finding loss.
+//
+// The V2 fingerprint is line-independent by design (baseline stability), so an
+// analyzer that builds findings directly and lets Add derive the fingerprint
+// from a static message gives two genuinely distinct findings in one file the
+// same fingerprint. Deduplicate keyed on fingerprint alone then dropped the
+// second — a real second MD5 call, a real second hardcoded secret, never
+// reported.
+func TestDeduplicate_KeepsDistinctFindingsAtDifferentLines(t *testing.T) {
+	fs := NewFindingSet()
+	// Same rule, same file, same message — differing only in line, exactly the
+	// shape a direct-construction analyzer produces for two occurrences.
+	fs.Add(Finding{RuleID: "CRYPTO-001", Message: "Use of MD5",
+		Location: Location{FilePath: "hash.go", StartLine: 10}})
+	fs.Add(Finding{RuleID: "CRYPTO-001", Message: "Use of MD5",
+		Location: Location{FilePath: "hash.go", StartLine: 50}})
+
+	fs.Deduplicate()
+
+	if got := len(fs.Findings()); got != 2 {
+		t.Errorf("expected both distinct findings to survive dedup, got %d", got)
+	}
+}
+
+// TestDeduplicate_RemovesTrueDuplicates confirms the fix did not disable dedup:
+// two findings identical in rule, location AND fingerprint are still collapsed.
+func TestDeduplicate_RemovesTrueDuplicates(t *testing.T) {
+	fs := NewFindingSet()
+	f := Finding{RuleID: "CRYPTO-001", Message: "Use of MD5",
+		Location: Location{FilePath: "hash.go", StartLine: 10}}
+	fs.Add(f)
+	fs.Add(f)
+
+	fs.Deduplicate()
+
+	if got := len(fs.Findings()); got != 1 {
+		t.Errorf("expected a true duplicate to be removed, got %d findings", got)
+	}
+}
+
+func TestFormatSeverityCounts(t *testing.T) {
+	tests := []struct {
+		name   string
+		counts map[Severity]int
+		want   string
+	}{
+		{"empty is blank", map[Severity]int{}, ""},
+		{"all zero is blank", map[Severity]int{SeverityHigh: 0}, ""},
+		{"single", map[Severity]int{SeverityHigh: 3}, "3 high"},
+		{"canonical order regardless of map order", map[Severity]int{
+			SeverityLow: 1, SeverityCritical: 2, SeverityHigh: 5,
+		}, "2 critical, 5 high, 1 low"},
+		{"omits zeros between", map[Severity]int{
+			SeverityCritical: 1, SeverityMedium: 4,
+		}, "1 critical, 4 medium"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := FormatSeverityCounts(tt.counts); got != tt.want {
+				t.Errorf("FormatSeverityCounts = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// SeverityOrder must be the source the priority rank derives from — a drift
+// between the two would reorder findings differently from how they are
+// summarised.
+func TestSeverityOrderDrivesPriorityRank(t *testing.T) {
+	if len(SeverityOrder) != 5 {
+		t.Fatalf("SeverityOrder has %d entries, want 5", len(SeverityOrder))
+	}
+	for i, s := range SeverityOrder {
+		if severityPriorityRank[s] != i {
+			t.Errorf("rank of %s = %d, want %d (must derive from SeverityOrder)", s, severityPriorityRank[s], i)
+		}
+	}
+	if SeverityOrder[0] != SeverityCritical || SeverityOrder[4] != SeverityInfo {
+		t.Errorf("SeverityOrder must run critical..info, got %v", SeverityOrder)
+	}
+}
+
+func TestSeverityRank(t *testing.T) {
+	if SeverityRank(SeverityCritical) != 0 || SeverityRank(SeverityInfo) != 4 {
+		t.Errorf("ranks: critical=%d info=%d, want 0 and 4", SeverityRank(SeverityCritical), SeverityRank(SeverityInfo))
+	}
+	// An unrecognised severity ranks past info so it sorts last, never tying.
+	if SeverityRank(Severity("bogus")) != len(SeverityOrder) {
+		t.Errorf("unknown severity rank = %d, want %d", SeverityRank(Severity("bogus")), len(SeverityOrder))
+	}
+	// Rank must agree with SeverityOrder for every level.
+	for i, s := range SeverityOrder {
+		if SeverityRank(s) != i {
+			t.Errorf("SeverityRank(%s) = %d, want %d", s, SeverityRank(s), i)
+		}
+	}
+}
+
+func TestCountBySeverity(t *testing.T) {
+	ff := []Finding{
+		{Severity: SeverityHigh}, {Severity: SeverityHigh}, {Severity: SeverityCritical},
+	}
+	c := CountBySeverity(ff)
+	if c[SeverityHigh] != 2 || c[SeverityCritical] != 1 {
+		t.Errorf("CountBySeverity = %v", c)
+	}
+	if len(CountBySeverity(nil)) != 0 {
+		t.Error("CountBySeverity(nil) should be empty")
+	}
+}
+
+func TestSeverityLadder(t *testing.T) {
+	// Downgraded and Upgraded are inverses, with the ends idempotent.
+	down := map[Severity]Severity{
+		SeverityCritical: SeverityHigh, SeverityHigh: SeverityMedium,
+		SeverityMedium: SeverityLow, SeverityLow: SeverityInfo, SeverityInfo: SeverityInfo,
+	}
+	for s, want := range down {
+		if got := s.Downgraded(); got != want {
+			t.Errorf("%s.Downgraded() = %s, want %s", s, got, want)
+		}
+	}
+	up := map[Severity]Severity{
+		SeverityInfo: SeverityLow, SeverityLow: SeverityMedium,
+		SeverityMedium: SeverityHigh, SeverityHigh: SeverityCritical, SeverityCritical: SeverityCritical,
+	}
+	for s, want := range up {
+		if got := s.Upgraded(); got != want {
+			t.Errorf("%s.Upgraded() = %s, want %s", s, got, want)
+		}
+	}
+	// An unrecognized severity is unchanged either way.
+	if Severity("weird").Upgraded() != "weird" || Severity("weird").Downgraded() != "weird" {
+		t.Error("unknown severity must pass through the ladder unchanged")
 	}
 }

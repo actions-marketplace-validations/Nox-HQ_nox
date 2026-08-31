@@ -21,12 +21,19 @@ If you're shipping LLM features — `chat.completions.create`, RAG ingest into a
 - **Prompt injection** at the call site (AI-PI-*, OWASP LLM01)
 - **Embedding leakage** when secrets / PII land in vector stores (AI-EMBED-*, LLM06)
 - **Agent over-privilege** when `file_read` + `http_request` live in the same agent context (AI-AGENT-*, LLM07)
-- **MCP server hardening** misconfigs (MCP-001..008)
+- **Agent-config execution surface** (AGENT-001..006) — the files that steer a coding agent are code: injection directives in `.cursorrules`/`CLAUDE.md`/skills, permission-bypass (`bypassPermissions`, `--dangerously-skip-permissions`), wildcard tool grants (`"Bash(*)"`), exfiltration directives in `.claude/settings.json`, unauthenticated **A2A agent cards** (`agent.json` with an empty/`none` security scheme, ASI07), and **DXT desktop-extension** manifests that interpolate `${user_config.*}` into a server command (ASI02)
+- **Slopsquatting / hallucinated packages** (SLOP-001) — source imports of a package that exists in no manifest, no standard library, and no local module: the surface an attacker slopsquats after an LLM invents the name. Deterministic, offline, Python + JS/TS
+- **CVE variants in your own code** (`nox variants`, VARIANT-*) — first-party code that reproduces the root cause of a known CVE (Log4Shell, Zip Slip, PyYAML full-loader, tar path traversal, SSTI, shell interpolation) even when no vulnerable dependency is present
+- **Unverifiable dependency provenance** (PROV-001/002, OWASP ASI04 / SLSA) — dependencies pulled from a VCS/URL/tarball instead of a signed registry, or a VCS dep pinned to a mutable branch/tag instead of an immutable commit SHA
+- **OWASP Top 10 for Agentic Applications (ASI01–ASI10)** mapping on findings, alongside the LLM and MCP Top 10 — traceable from static rule to runtime attack to GRC evidence
+- **Full MCP threat coverage** mapped to the OWASP MCP Top 10 — server hardening (MCP-001..008), tool poisoning (MCP-009..014, MCP03), rug-pull / definition drift (MCP-015, MCP04), authn/authz & SSRF (MCP-016..021, MCP07), shadow & cross-server tool shadowing (MCP-022..024, MCP09)
 - **Cross-file AI taint** — `request.json` → service hop → `chat.completions.create` across functions and files (TAINT-AI-*)
 - **Polyglot AIBOM** — Python ingest + Go service + TS frontend produce one inventory naming every model invocation, auth env var, and endpoint
-- **Verified plugin marketplace** — extension scanners (reachability, cross-file taint, k8s-runtime, red-team chains, GRC for 12 frameworks) install with one command, signed end-to-end via Sigstore
+- **Verified plugin marketplace** — extension scanners (reachability, cross-file taint, k8s-runtime, red-team chains, GRC for 15 frameworks incl. EU AI Act / ISO 42001 / NIST AI RMF) install with one command, signed end-to-end via Sigstore
 
 Built so you can keep your source local, your CI green, and your CISO answered without paying a per-seat SaaS bill or sending code to a vendor.
+
+> **The MCP scanner that never sees your code.** No API. No token. No telemetry. Deterministic. Run `nox scan --offline` and the scan path makes zero outbound connections — enforced by a test, not a promise (`TestOSVDisabled_NoNetworkEgress`). Unlike scanners that proxy your traffic or phone home to a vendor API, nox runs entirely on your machine.
 
 - **Deterministic** -- same inputs produce same outputs, no hidden state
 - **Offline-first** -- zero required external services
@@ -74,7 +81,7 @@ reports/
 
 ```yaml
 # .github/workflows/security.yml
-- uses: nox-hq/nox@24c7f00916ad15e99b6c44cdda8e55f05b869e43 # v0.4.2
+- uses: nox-hq/nox@9133597590c30b2235093c48425c0afcecef0700 # v1.5.0
   with:
     path: '.'
     format: sarif
@@ -89,6 +96,20 @@ reports/
 
 ```bash
 nox serve --allowed-paths /path/to/project
+```
+
+### Use in your editor (LSP)
+
+`nox lsp` runs a Language Server over stdio, publishing findings as inline
+diagnostics — squiggles, hover, the Problems panel — on open and save.
+Deterministic and offline: it runs the local `nox` binary, no code leaves your
+machine. Thin clients over it ship for **VS Code**
+([`editors/vscode`](editors/vscode)) and **JetBrains** IDEs
+([`editors/jetbrains`](editors/jetbrains) — IntelliJ IDEA Ultimate, GoLand,
+PyCharm Professional, WebStorm, …; LSP4IJ for the Community editions).
+
+```bash
+nox lsp    # spoken by the editor extension; not run by hand
 ```
 
 This starts an MCP server on stdio with 10 read-only tools and 5 resources. See [MCP Server](#mcp-server) for details.
@@ -189,6 +210,21 @@ Parses lockfiles from **8 ecosystems** (Go, npm, PyPI, RubyGems, Cargo, Maven, G
 - Disable with `--no-osv` flag or `scan.osv.disabled: true` in `.nox.yaml`
 - Vulnerability data enriches CycloneDX and SPDX SBOM output
 
+### Supply-chain integrity (deterministic, offline)
+
+Beyond version-based SCA, nox flags supply-chain risks that have no CVE — the
+insecure *shape*, not a known-bad version:
+
+| Rule | Description |
+|------|-------------|
+| SLOP-001 | Imported package is not declared in any manifest, standard library, or local module — a hallucinated / slopsquatted package (Python + JS/TS) |
+| VARIANT-001..006 | First-party code reproducing a known-CVE root cause (Log4Shell, PyYAML full-loader, tar path traversal, Zip Slip, SSTI, shell interpolation). See `nox variants` |
+| PROV-001 | Dependency from a non-registry source (VCS/URL/tarball) — provenance cannot be verified (ASI04 / SLSA) |
+| PROV-002 | VCS dependency pinned to a mutable ref instead of an immutable commit SHA |
+
+All four never contact a registry. `nox variants [CVE-ID] [path]` reports CVE
+variants directly; `nox variants --list` enumerates the signatures.
+
 ### Data Protection (12 rules)
 
 Detects personally identifiable information (PII) and sensitive data patterns in code and configuration:
@@ -202,9 +238,39 @@ Detects personally identifiable information (PII) and sensitive data patterns in
 | Infrastructure | DATA-005 | Hardcoded public IP addresses |
 | Personal | DATA-006 | Date of birth fields |
 
+### Memory safety (Go)
+
+| Rule | Description |
+|------|-------------|
+| MEMSAFE-001 | Integer truncation reaching a `make()` size or a slice bound — a narrowed or sign-flipped length that wraps (CWE-190) |
+
+Deliberately much narrower than gosec's `G115`, which reports every narrowing
+conversion: measured across sixteen Go repositories, that produced 96 findings
+and no real bugs. This rule reports only truncation that sizes memory, and
+suppresses masks, modulo, unsigned shifts, guarded values and length-derived
+values. Conversions whose operand type is not provable from the enclosing
+function are not reported — nox parses Go with `go/ast`, not `go/types`. See
+[`docs/design/go-integer-overflow.md`](docs/design/go-integer-overflow.md).
+
 ## Configuration
 
 Create a `.nox.yaml` in your project root to customize scan behavior:
+
+> nox reports configuration it cannot act on. A key it does not recognise, and a
+> key it parses but ignores, both mean the policy you wrote is not the policy in
+> force — so `nox scan` names them under `[degraded]` rather than passing in
+> silence. Two keys are currently accepted and ignored: `compliance.framework`
+> (no framework filtering is applied) and `cache` (nox never caches a scan, so
+> the block configures nothing; the `--no-cache` flag is accepted as a no-op for
+> the same reason).
+
+`scan.include` is an allow-list of glob patterns: when set, only matching files
+are scanned. `scan.exclude` still wins over it, so writing both means the
+intersection. Directories are still descended — a glob cannot tell you in
+advance whether a subtree contains a match, and pruning on that guess loses
+files silently; use `scan.exclude` to keep a subtree out of the walk entirely.
+Plugins receive the exclude patterns too, so a plugin that walks the tree itself
+honours them rather than crashing on a path you asked it to skip.
 
 ```yaml
 scan:
@@ -436,6 +502,40 @@ nox protect uninstall
 make hooks
 ```
 
+### Dynamic Exploit Validation
+
+Static analysis tells you what is dangerous. `nox attack` tells you whether an
+attacker can actually do it.
+
+```bash
+nox scan ./my-app --output .          # static, offline
+nox attack plan .                     # exploit hypotheses — offline, sends nothing
+nox attack run --profile safe         # simulate: what would be attempted
+nox attack run --target http://127.0.0.1:8000 \
+  --route /chat --fields persona,message \
+  --profile sandbox --authorize       # ACTIVE
+nox attack regress --record           # confirmed exploits become regression tests
+```
+
+Findings carry an exploitability state independent of severity — `POTENTIAL`,
+`PLAUSIBLE`, `PREVENTED`, `INCONCLUSIVE`, `CONFIRMED`. Reaching `CONFIRMED`
+requires an observed invariant violation, a sound benign control, reproduction
+under a k-of-n gate, **and** deterministic evidence: a model's opinion that an
+attack "probably worked" is recorded, labelled, and cannot confirm anything.
+
+Success is never scored on a string the payload carried, so an app that merely
+echoes input can never be mistaken for one that obeyed it.
+
+`nox attack plan` is offline and read-only. `run`, `replay`, and `regress` are
+ACTIVE — they send attack payloads, are never part of `nox scan`, refuse to run
+without `--authorize`, and do not sandbox your target.
+
+Over MCP, only `attack_plan` is exposed. The ACTIVE subcommands are deliberately
+absent: `--authorize` exists so a *human* affirms they own the target, and nox
+analyses untrusted repositories — an MCP-exposed attack runner would let text in
+a README steer requests at a host of its choosing. Plan and read over MCP; act
+from the CLI. See [docs/attack.md](docs/attack.md).
+
 ## CLI Reference
 
 ```
@@ -463,6 +563,9 @@ Commands:
   fix                      Apply OSV fixed_in remediation upgrades (go/npm/pypi/cargo)
   doctor                   Report environment, plugin state, config sanity
   agent-graph              Render agent capability lattice (mermaid/dot)
+  confirm                  ACTIVE: dynamically confirm AI prompt-injection findings
+  attack <cmd>             Dynamic exploit validation (plan, run, replay, regress)
+                              `plan` is offline; the rest are ACTIVE and need --authorize
   bench                    Scan a corpus directory; report rule fire-rates
   calibrate                Suggest severity overrides from a bench report
   version                  Print version and exit
@@ -478,7 +581,7 @@ Scan Flags:
   --staged                 Scan only git-staged files
   --severity-threshold     Minimum severity to report (critical, high, medium, low)
   --no-osv                 Disable OSV.dev vulnerability lookups (offline mode)
-  --no-cache               Disable incremental scan cache
+  --no-cache               No-op; accepted for compatibility (scans are never cached)
   --changed-since string   Only scan files changed since git ref
 
 Show Flags:
@@ -612,7 +715,11 @@ See [`docs/plugin-authoring.md`](docs/plugin-authoring.md) for the full SDK guid
 
 The official registry is auto-added on first run; no `nox registry add` needed for the public set. Operators add private registries on top.
 
-**Recommended: declare plugins in `.nox.yaml`** so anyone cloning your project gets the right set automatically:
+**Declaring plugins in `.nox.yaml` is what makes them run during a scan.**
+Installing a plugin puts it on the machine; listing it under `plugins.required`
+is what enables it for a project. That separation is deliberate — it keeps a
+scan's results from depending on which plugins happen to be installed, so
+everyone cloning your project gets the same set and the same findings:
 
 ```yaml
 # .nox.yaml
@@ -633,7 +740,11 @@ nox scan .                        # auto-installs missing required plugins
 nox scan . --no-auto-install      # opt out
 ```
 
-**One-shot install (no manifest):**
+**Working with plugins directly (no manifest).** These commands address a
+plugin by name and do not consult `.nox.yaml`. Note that `nox plugin install`
+alone does *not* make a plugin participate in `nox scan` — add it to
+`plugins.required` for that. `nox plugin list` shows which installed plugins
+are active in the current directory:
 
 ```bash
 # Search and install (registry auto-configured)
@@ -717,9 +828,9 @@ nox serve --allowed-paths /path/to/project
 | `list_findings` | `severity`, `rule`, `file`, `limit` | List findings with filtering |
 | `baseline_status` | `path` | Get baseline statistics |
 | `baseline_add` | `path`, `fingerprint`, `reason` | Add finding to baseline |
+| `attack_plan` | `path` | Build exploit hypotheses from the last scan. Offline: contacts no target, executes nothing |
 | `plugin.list` | -- | List registered plugins |
 | `plugin.call_tool` | `tool`, `input`, `workspace_root` | Invoke a plugin tool |
-| `plugin.read_resource` | `plugin`, `uri` | Read a plugin resource |
 
 ### Resources
 
@@ -731,7 +842,21 @@ nox serve --allowed-paths /path/to/project
 | `nox://sbom/spdx` | application/json | SPDX SBOM |
 | `nox://ai-inventory` | application/json | AI component inventory |
 
-All tools are read-only. Output is truncated at 1 MB. Workspace paths are allowlisted.
+Output is truncated at 1 MB. Workspace paths are allowlisted.
+
+Most tools are read-only. The exceptions are explicit: `baseline_add` /
+`baseline_add_many` write the baseline file, and `plugin_install` runs new code
+on the operator's machine and requires `confirmed: true`, which the MCP host must
+collect from a human.
+
+**No ACTIVE capability is exposed over MCP.** `nox attack run` / `replay` /
+`regress` and `nox confirm` send attack payloads at a network target, and they
+are CLI-only by design. `--authorize` exists so a *human* affirms they own and
+have isolated the target; a model-initiated tool call cannot make that
+affirmation. And because nox analyses untrusted repositories, an MCP-exposed
+attack runner would let attacker-controlled text steer requests at a host of its
+choosing — the confused-deputy pattern nox itself scans for. `attack_plan` is
+exposed because it only reasons over artifacts already on disk.
 
 ## Contributing
 

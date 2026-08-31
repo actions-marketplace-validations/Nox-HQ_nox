@@ -25,6 +25,36 @@ type iacRule struct {
 	// Used e.g. by IAC-013 to declare a trusted-publisher allowlist that the
 	// regex matcher consumes via a post-filter.
 	extraMetadata map[string]string
+	// retires lists rule IDs this rule absorbed, with the pattern each of them
+	// carried at retirement. It is what keeps baselines, VEX statements and
+	// nox:ignore comments written against the retired ID matching — see
+	// rules.RetiredRule. Retiring an ID without it un-waives, in every
+	// consuming repo, findings an operator explicitly accepted.
+	retires []rules.RetiredRule
+	// absence* fields, when set, switch the rule to the block-scoped absence
+	// matcher (matcher_type "absence") instead of a plain regex. They replace
+	// the RE2-incompatible negative-lookahead patterns that never compiled: the
+	// matcher finds absenceAnchor, bounds its span per absenceSpan, and fires
+	// when absenceProperty is missing from that span. See rules.Rule.Absence*.
+	absenceAnchor   string
+	absenceProperty string
+	absenceRequire  string
+	absenceSpan     string
+	// absenceResourceTypes and absencePropertyPath make the rule STRUCTURAL:
+	// the document is parsed and the property is resolved by path, instead of
+	// searched for as text inside a span guessed by indentation. See
+	// rules.Rule.AbsenceResourceTypes for the model and why this is the only
+	// way an IAC finding carries a claim stronger than "a pattern matched".
+	//
+	// The anchor and property regexes stay set alongside them and stay
+	// authoritative for any file the parser cannot read, so migrating a rule
+	// adds a capability rather than trading one for another.
+	absenceResourceTypes []string
+	absencePropertyPath  []string
+	// absenceRequireAll requires EVERY branch a wildcard opens to satisfy the
+	// path. A pod is hardened only when every container is; "any" would call a
+	// pod with one hardened container safe.
+	absenceRequireAll bool
 }
 
 // builtinBaseIaCRules returns the original set of IaC security rules (IAC-001 to IAC-185).
@@ -35,7 +65,7 @@ func builtinBaseIaCRules() []rules.Rule {
 		// =================================================================
 		{
 			id: "IAC-001", severity: findings.SeverityHigh, confidence: findings.ConfidenceMedium,
-			pattern:     `(?im)^\s*USER\s+root\s*$`,
+			pattern:     `(?im)^[ \t]*USER\s+root\s*$`,
 			description: "Dockerfile runs as root user",
 			cwe:         "CWE-250", keywords: []string{"user root"},
 			filePatterns: []string{"Dockerfile", "Dockerfile.*", "*.dockerfile"},
@@ -45,7 +75,7 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-002", severity: findings.SeverityMedium, confidence: findings.ConfidenceMedium,
-			pattern:     `(?im)^\s*FROM\s+[a-zA-Z0-9._/-]+\s*$|(?im)^\s*FROM\s+\S+:latest\b`,
+			pattern:     `(?im)^[ \t]*FROM\s+[a-zA-Z0-9._/-]+\s*$|(?im)^[ \t]*FROM\s+\S+:latest\b`,
 			description: "Dockerfile uses unpinned base image (latest or no tag)",
 			cwe:         "CWE-829", keywords: []string{"from"},
 			filePatterns: []string{"Dockerfile", "Dockerfile.*", "*.dockerfile"},
@@ -55,7 +85,7 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-003", severity: findings.SeverityLow, confidence: findings.ConfidenceHigh,
-			pattern:     `(?im)^\s*ADD\s+`,
+			pattern:     `(?im)^[ \t]*ADD\s+`,
 			description: "Dockerfile uses ADD instead of COPY",
 			cwe:         "CWE-829", keywords: []string{"add"},
 			filePatterns: []string{"Dockerfile", "Dockerfile.*", "*.dockerfile"},
@@ -65,7 +95,7 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-022", severity: findings.SeverityHigh, confidence: findings.ConfidenceMedium,
-			pattern:     `(?im)^\s*ARG\s+(PASSWORD|SECRET|TOKEN|API_KEY|PRIVATE_KEY|DB_PASS|MYSQL_PASSWORD|POSTGRES_PASSWORD)\b`,
+			pattern:     `(?im)^[ \t]*ARG\s+(PASSWORD|SECRET|TOKEN|API_KEY|PRIVATE_KEY|DB_PASS|MYSQL_PASSWORD|POSTGRES_PASSWORD)\b`,
 			description: "Secret value passed as Docker build argument",
 			cwe:         "CWE-798", keywords: []string{"arg"},
 			filePatterns: []string{"Dockerfile", "Dockerfile.*", "*.dockerfile"},
@@ -85,7 +115,7 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-024", severity: findings.SeverityMedium, confidence: findings.ConfidenceMedium,
-			pattern:     `(?im)^\s*RUN\s+.*\bsudo\b`,
+			pattern:     `(?im)^[ \t]*RUN\s+.*\bsudo\b`,
 			description: "Dockerfile RUN uses sudo (unnecessary in Docker build)",
 			cwe:         "CWE-250", keywords: []string{"sudo"},
 			filePatterns: []string{"Dockerfile", "Dockerfile.*", "*.dockerfile"},
@@ -95,7 +125,7 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-025", severity: findings.SeverityMedium, confidence: findings.ConfidenceHigh,
-			pattern:     `(?im)^\s*(COPY|ADD)\s+--chmod=777\b`,
+			pattern:     `(?im)^[ \t]*(COPY|ADD)\s+--chmod=777\b`,
 			description: "Dockerfile COPY/ADD sets world-writable permissions",
 			cwe:         "CWE-732", keywords: []string{"chmod=777"},
 			filePatterns: []string{"Dockerfile", "Dockerfile.*", "*.dockerfile"},
@@ -119,7 +149,25 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-005", severity: findings.SeverityHigh, confidence: findings.ConfidenceLow,
-			pattern:     `(?i)encrypt\w*\s*=\s*(false|"false")`,
+			// `\b` keeps this generic rule off attributes that a specific rule
+			// owns. Without it `encrypt\w*` matched the tail of
+			// `storage_encrypted = false`, so IAC-037 (RDS storage encryption,
+			// high confidence) and this rule (low confidence, generic message)
+			// both reported one line. The boundary makes the split legible:
+			// this rule covers attributes NAMED encrypt* (`encrypted = false`
+			// on an EBS volume), a prefixed attribute belongs to the rule that
+			// knows the resource. Surviving matches keep their exact matched
+			// text, so their fingerprints — and any baseline entry — are
+			// unchanged.
+			//
+			// The cost is prefixed attributes that no specific rule covers yet
+			// (`at_rest_encryption_enabled = false`, `transit_encryption_enabled
+			// = false` on ElastiCache): they are no longer reported. RE2 has no
+			// negative lookbehind, so a boundary is the only way to keep this
+			// pattern off the specific rules' ground, and a low-confidence
+			// generic message was never the right home for them — a rule per
+			// resource is.
+			pattern:     `(?i)\bencrypt\w*\s*=\s*(false|"false")`,
 			description: "Terraform resource has encryption disabled",
 			cwe:         "CWE-311", keywords: []string{"encrypt"},
 			filePatterns: []string{"*.tf", "*.tfvars"},
@@ -144,6 +192,7 @@ func builtinBaseIaCRules() []rules.Rule {
 			cwe:         "CWE-284", keywords: []string{"publicly_accessible"},
 			filePatterns: []string{"*.tf", "*.tfvars"},
 			tags:         []string{"iac", "terraform", "database", "network"},
+			retires:      []rules.RetiredRule{{ID: "IAC-283", Pattern: `(?i)publicly_accessible\s*=\s*true`}},
 			remediation:  "Set publicly_accessible = false and access the database through a VPC, bastion host, or VPN. Public database instances are a common attack vector.",
 			references:   []string{"https://cwe.mitre.org/data/definitions/284.html"},
 		},
@@ -204,6 +253,7 @@ func builtinBaseIaCRules() []rules.Rule {
 			cwe:         "CWE-319", keywords: []string{"enable_https_traffic_only"},
 			filePatterns: []string{"*.tf"},
 			tags:         []string{"iac", "terraform", "azure", "encryption"},
+			retires:      []rules.RetiredRule{{ID: "IAC-321", Pattern: `(?i)enable_https_traffic_only\s*=\s*false`}},
 			remediation:  "Set enable_https_traffic_only = true to enforce HTTPS on Azure storage accounts. HTTP traffic exposes data to eavesdropping and tampering.",
 			references:   []string{"https://cwe.mitre.org/data/definitions/319.html"},
 		},
@@ -243,13 +293,25 @@ func builtinBaseIaCRules() []rules.Rule {
 		// =================================================================
 		{
 			id: "IAC-007", severity: findings.SeverityCritical, confidence: findings.ConfidenceHigh,
-			pattern:     `(?i)privileged\s*:\s*true`,
-			description: "Kubernetes pod running as privileged",
+			// The single rule for `privileged: true`. IAC-065 (CloudFormation
+			// ECS) and IAC-237 (Kustomize) reported the same condition, so one
+			// line produced three findings at two severities. Absorbing them
+			// costs two things they could do that this could not: the quoted
+			// `Privileged: "true"` form, and *.template files. Both are
+			// covered here now, and `retires` keeps their waivers working.
+			pattern:     `(?i)privileged\s*:\s*(?:true|"true")`,
+			description: "Container runs in privileged mode",
 			cwe:         "CWE-250", keywords: []string{"privileged"},
-			filePatterns: []string{"*.yaml", "*.yml"},
-			tags:         []string{"iac", "kubernetes", "privilege"},
-			remediation:  "Set privileged: false in the pod security context. If specific capabilities are needed, use securityContext.capabilities.add with only what is required and drop ALL others. Enable readOnlyRootFilesystem: true where possible. Set runAsNonRoot: true and specify a non-root runAsUser. Apply Pod Security Standards.",
-			references:   []string{"https://cwe.mitre.org/data/definitions/250.html", "https://kubernetes.io/docs/concepts/security/pod-security-standards/"},
+			filePatterns: []string{"*.yaml", "*.yml", "*.template"},
+			tags:         []string{"iac", "kubernetes", "cloudformation", "kustomize", "privilege"},
+			retires: []rules.RetiredRule{
+				// Only IAC-065's privileged branch moved here; its root-user
+				// branch stayed behind and IAC-065 still reports it.
+				{ID: "IAC-065", Pattern: `(?i)Privileged\s*:\s*(true|"true")`},
+				{ID: "IAC-237", Pattern: `(?i)privileged:\s*true`},
+			},
+			remediation: "Set privileged: false (Kubernetes securityContext, ECS ContainerDefinitions.Privileged, or the Kustomize patch that sets it). If specific capabilities are needed, use securityContext.capabilities.add with only what is required and drop ALL others. Enable readOnlyRootFilesystem: true where possible. Set runAsNonRoot: true and specify a non-root runAsUser. Apply Pod Security Standards.",
+			references:  []string{"https://cwe.mitre.org/data/definitions/250.html", "https://kubernetes.io/docs/concepts/security/pod-security-standards/"},
 		},
 		{
 			id: "IAC-008", severity: findings.SeverityHigh, confidence: findings.ConfidenceHigh,
@@ -288,6 +350,7 @@ func builtinBaseIaCRules() []rules.Rule {
 			cwe:         "CWE-250", keywords: []string{"hostpid"},
 			filePatterns: []string{"*.yaml", "*.yml"},
 			tags:         []string{"iac", "kubernetes", "privilege"},
+			retires:      []rules.RetiredRule{{ID: "IAC-291", Pattern: `(?i)hostPID:\s*true`}},
 			remediation:  "Remove hostPID: true. Sharing the host PID namespace allows the container to see and signal all processes on the host, breaking process isolation.",
 			references:   []string{"https://cwe.mitre.org/data/definitions/250.html"},
 		},
@@ -298,12 +361,13 @@ func builtinBaseIaCRules() []rules.Rule {
 			cwe:         "CWE-250", keywords: []string{"hostipc"},
 			filePatterns: []string{"*.yaml", "*.yml"},
 			tags:         []string{"iac", "kubernetes", "privilege"},
+			retires:      []rules.RetiredRule{{ID: "IAC-292", Pattern: `(?i)hostIPC:\s*true`}},
 			remediation:  "Remove hostIPC: true. Sharing the host IPC namespace allows containers to access shared memory and IPC resources of other host processes.",
 			references:   []string{"https://cwe.mitre.org/data/definitions/250.html"},
 		},
 		{
 			id: "IAC-028", severity: findings.SeverityHigh, confidence: findings.ConfidenceHigh,
-			pattern:     `(?im)^\s*-\s*(SYS_ADMIN|SYS_PTRACE|NET_RAW|SYS_MODULE|DAC_OVERRIDE)\s*$`,
+			pattern:     `(?im)^[ \t]*-\s*(SYS_ADMIN|SYS_PTRACE|NET_RAW|SYS_MODULE|DAC_OVERRIDE)\s*$`,
 			description: "Container adds dangerous Linux capability",
 			cwe:         "CWE-250", keywords: []string{"sys_admin", "sys_ptrace", "net_raw"},
 			filePatterns: []string{"*.yaml", "*.yml"},
@@ -328,6 +392,7 @@ func builtinBaseIaCRules() []rules.Rule {
 			cwe:         "CWE-269", keywords: []string{"automountserviceaccounttoken"},
 			filePatterns: []string{"*.yaml", "*.yml"},
 			tags:         []string{"iac", "kubernetes", "privilege"},
+			retires:      []rules.RetiredRule{{ID: "IAC-287", Pattern: `(?i)automountServiceAccountToken:\s*true`}},
 			remediation:  "Set automountServiceAccountToken: false unless the pod requires Kubernetes API access. Mounted tokens can be used for lateral movement if the pod is compromised.",
 			references:   []string{"https://cwe.mitre.org/data/definitions/269.html"},
 		},
@@ -452,11 +517,17 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-017", severity: findings.SeverityMedium, confidence: findings.ConfidenceHigh,
-			pattern:     `::set-output\s+name=`,
+			// Case-insensitive so it covers everything the retired IAC-312
+			// caught. IAC-312 dropped the `::` prefix entirely, which is what
+			// makes the workflow command a command; without it the pattern
+			// also matched prose about set-output. That looseness is not
+			// carried over.
+			pattern:     `(?i)::set-output\s+name=`,
 			description: "Workflow uses deprecated set-output command",
 			cwe:         "CWE-77", keywords: []string{"set-output"},
 			filePatterns: []string{"*.yml", "*.yaml"},
 			tags:         []string{"iac", "github-actions", "deprecated"},
+			retires:      []rules.RetiredRule{{ID: "IAC-312", Pattern: `(?i)set-output\s+name=`}},
 			remediation:  "Replace ::set-output with $GITHUB_OUTPUT environment file. The set-output command is deprecated and vulnerable to log injection attacks.",
 			references:   []string{"https://cwe.mitre.org/data/definitions/77.html", "https://github.blog/changelog/2022-10-11-github-actions-deprecating-save-state-and-set-output-commands/"},
 		},
@@ -467,8 +538,13 @@ func builtinBaseIaCRules() []rules.Rule {
 			cwe:         "CWE-755", keywords: []string{"continue-on-error"},
 			filePatterns: []string{"*.yml", "*.yaml"},
 			tags:         []string{"iac", "github-actions", "error-handling"},
-			remediation:  "Avoid continue-on-error: true as it can mask security check failures. If needed, check the step outcome explicitly and fail on security-critical errors.",
-			references:   []string{"https://cwe.mitre.org/data/definitions/755.html"},
+			// The retired IAC-310 reported this at medium; keeping the older
+			// ID's low is the conservative half of an arbitrary split — a
+			// deliberately non-blocking step is a hygiene signal, and a gate
+			// keyed on medium should not start failing because of a de-dup.
+			retires:     []rules.RetiredRule{{ID: "IAC-310", Pattern: `(?i)continue-on-error:\s*true`}},
+			remediation: "Avoid continue-on-error: true as it can mask security check failures. If needed, check the step outcome explicitly and fail on security-critical errors.",
+			references:  []string{"https://cwe.mitre.org/data/definitions/755.html"},
 		},
 
 		// =================================================================
@@ -564,9 +640,13 @@ func builtinBaseIaCRules() []rules.Rule {
 		// =================================================================
 		{
 			id: "IAC-051", severity: findings.SeverityHigh, confidence: findings.ConfidenceMedium,
-			pattern:     `(?i)AWS::S3::Bucket[^}]*(?:Properties\s*:[^}]*(?!BucketEncryption|SSEAlgorithm))[^}]*\}`,
-			description: "CloudFormation S3 bucket missing encryption configuration",
-			cwe:         "CWE-311", keywords: []string{"AWS::S3::Bucket", "BucketEncryption"},
+			absenceAnchor:        `(?i)AWS::S3::Bucket`,
+			absenceProperty:      `(?i)BucketEncryption|SSEAlgorithm`,
+			absenceSpan:          "brace-enclosing",
+			absenceResourceTypes: []string{"AWS::S3::Bucket"},
+			absencePropertyPath:  []string{"Properties.BucketEncryption"},
+			description:          "CloudFormation S3 bucket missing encryption configuration",
+			cwe:                  "CWE-311", keywords: []string{"AWS::S3::Bucket", "BucketEncryption"},
 			filePatterns: []string{"*.template", "*.json", "*.yaml", "*.yml"},
 			tags:         []string{"iac", "cloudformation", "aws", "encryption"},
 			remediation:  "Add BucketEncryption with ServerSideEncryptionConfiguration using SSEAlgorithm: aws:kms or AES256 to all S3 bucket definitions.",
@@ -634,9 +714,12 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-058", severity: findings.SeverityHigh, confidence: findings.ConfidenceLow,
-			pattern:     `(?i)"Effect"\s*:\s*"Allow"[^}]*(?!"Condition")[^}]*"Resource"\s*:\s*"\*"`,
-			description: "CloudFormation IAM policy without MFA condition on sensitive resources",
-			cwe:         "CWE-308", keywords: []string{"Effect", "Allow", "Condition", "MFA"},
+			absenceAnchor:   `(?i)"Effect"\s*:\s*"Allow"`,
+			absenceRequire:  `(?i)"Resource"\s*:\s*"\*"`,
+			absenceProperty: `(?i)"Condition"`,
+			absenceSpan:     "brace-enclosing",
+			description:     "CloudFormation IAM policy without MFA condition on sensitive resources",
+			cwe:             "CWE-308", keywords: []string{"Effect", "Allow", "Condition", "MFA"},
 			filePatterns: []string{"*.template", "*.json", "*.yaml", "*.yml"},
 			tags:         []string{"iac", "cloudformation", "aws", "iam"},
 			remediation:  "Add a Condition block requiring MFA for sensitive operations: aws:MultiFactorAuthPresent: true. This adds an extra layer of authentication.",
@@ -644,9 +727,11 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-059", severity: findings.SeverityHigh, confidence: findings.ConfidenceLow,
-			pattern:     `(?i)AWS::EC2::VPC(?!.*FlowLog)(?!.*TrafficType)`,
-			description: "CloudFormation VPC without flow logs",
-			cwe:         "CWE-778", keywords: []string{"AWS::EC2::VPC", "FlowLog", "TrafficType"},
+			absenceAnchor:   `(?i)AWS::EC2::VPC\b`,
+			absenceProperty: `(?i)FlowLog`,
+			absenceSpan:     "file",
+			description:     "CloudFormation VPC without flow logs",
+			cwe:             "CWE-778", keywords: []string{"AWS::EC2::VPC", "FlowLog", "TrafficType"},
 			filePatterns: []string{"*.template", "*.json", "*.yaml", "*.yml"},
 			tags:         []string{"iac", "cloudformation", "aws", "logging"},
 			remediation:  "Add an AWS::EC2::FlowLog resource for every VPC to capture network traffic metadata. Flow logs are essential for security monitoring and incident response.",
@@ -704,19 +789,31 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-065", severity: findings.SeverityHigh, confidence: findings.ConfidenceMedium,
-			pattern:     `(?i)(?:Privileged\s*:\s*(true|"true")|User\s*:\s*["']?(?:0|root)["']?)`,
-			description: "CloudFormation ECS task definition runs as privileged or root",
-			cwe:         "CWE-250", keywords: []string{"Privileged", "ContainerDefinitions", "TaskDefinition"},
+			// The privileged branch moved to IAC-007, which reported the same
+			// condition at critical. What is left is this rule's own
+			// contribution — a container definition running as root — and its
+			// matched text is unchanged, so existing findings keep their
+			// fingerprints and their baseline entries.
+			pattern:     `(?i)User\s*:\s*["']?(?:0|root)["']?`,
+			description: "CloudFormation ECS task definition runs as root",
+			// Keywords stay as they were: they gate at file level, so trimming
+			// "Privileged" here would stop scanning files this rule still has
+			// something to say about, for no gain.
+			cwe: "CWE-250", keywords: []string{"Privileged", "ContainerDefinitions", "TaskDefinition"},
 			filePatterns: []string{"*.template", "*.json", "*.yaml", "*.yml"},
 			tags:         []string{"iac", "cloudformation", "aws", "privilege"},
-			remediation:  "Set Privileged to false and avoid running as root (User: 0) in ECS task definitions. Use non-root users and drop unnecessary Linux capabilities.",
+			remediation:  "Avoid running as root (User: 0) in ECS task definitions. Use a non-root user and drop unnecessary Linux capabilities. Privileged mode is reported separately by IAC-007.",
 			references:   []string{"https://cwe.mitre.org/data/definitions/250.html"},
 		},
 		{
 			id: "IAC-066", severity: findings.SeverityMedium, confidence: findings.ConfidenceMedium,
-			pattern:     `(?i)AWS::SNS::Topic(?:[^}](?!KmsMasterKeyId))*\}`,
-			description: "CloudFormation SNS topic not encrypted with KMS",
-			cwe:         "CWE-311", keywords: []string{"AWS::SNS::Topic", "KmsMasterKeyId"},
+			absenceAnchor:        `(?i)AWS::SNS::Topic`,
+			absenceProperty:      `(?i)KmsMasterKeyId`,
+			absenceSpan:          "brace-enclosing",
+			absenceResourceTypes: []string{"AWS::SNS::Topic"},
+			absencePropertyPath:  []string{"Properties.KmsMasterKeyId"},
+			description:          "CloudFormation SNS topic not encrypted with KMS",
+			cwe:                  "CWE-311", keywords: []string{"AWS::SNS::Topic", "KmsMasterKeyId"},
 			filePatterns: []string{"*.template", "*.json", "*.yaml", "*.yml"},
 			tags:         []string{"iac", "cloudformation", "aws", "encryption"},
 			remediation:  "Add KmsMasterKeyId property to SNS topic resources. Encryption at rest protects messages from unauthorized access.",
@@ -794,9 +891,13 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-074", severity: findings.SeverityMedium, confidence: findings.ConfidenceLow,
-			pattern:     `(?i)AWS::CloudFront::Distribution(?:[^}](?!WebACLId))*\}`,
-			description: "CloudFormation CloudFront distribution without WAF",
-			cwe:         "CWE-693", keywords: []string{"AWS::CloudFront::Distribution", "WebACLId"},
+			absenceAnchor:        `(?i)AWS::CloudFront::Distribution`,
+			absenceProperty:      `(?i)WebACLId`,
+			absenceSpan:          "brace-enclosing",
+			absenceResourceTypes: []string{"AWS::CloudFront::Distribution"},
+			absencePropertyPath:  []string{"Properties.DistributionConfig.WebACLId"},
+			description:          "CloudFormation CloudFront distribution without WAF",
+			cwe:                  "CWE-693", keywords: []string{"AWS::CloudFront::Distribution", "WebACLId"},
 			filePatterns: []string{"*.template", "*.json", "*.yaml", "*.yml"},
 			tags:         []string{"iac", "cloudformation", "aws", "waf"},
 			remediation:  "Associate a WAF WebACL with CloudFront distributions using the WebACLId property. WAF protects against common web exploits and bot traffic.",
@@ -804,9 +905,13 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-075", severity: findings.SeverityMedium, confidence: findings.ConfidenceLow,
-			pattern:     `(?i)AWS::DynamoDB::Table(?:[^}](?!SSESpecification))*\}`,
-			description: "CloudFormation DynamoDB table without server-side encryption specification",
-			cwe:         "CWE-311", keywords: []string{"AWS::DynamoDB::Table", "SSESpecification"},
+			absenceAnchor:        `(?i)AWS::DynamoDB::Table`,
+			absenceProperty:      `(?i)SSESpecification`,
+			absenceSpan:          "brace-enclosing",
+			absenceResourceTypes: []string{"AWS::DynamoDB::Table"},
+			absencePropertyPath:  []string{"Properties.SSESpecification"},
+			description:          "CloudFormation DynamoDB table without server-side encryption specification",
+			cwe:                  "CWE-311", keywords: []string{"AWS::DynamoDB::Table", "SSESpecification"},
 			filePatterns: []string{"*.template", "*.json", "*.yaml", "*.yml"},
 			tags:         []string{"iac", "cloudformation", "aws", "encryption"},
 			remediation:  "Add SSESpecification with SSEEnabled: true and optionally a KMS key. While DynamoDB encrypts by default, explicit SSESpecification ensures KMS-managed encryption.",
@@ -844,9 +949,11 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-079", severity: findings.SeverityMedium, confidence: findings.ConfidenceLow,
-			pattern:     `(?i)AWS::SecretsManager::Secret(?:[^}](?!RotationRules|RotationSchedule))*\}`,
-			description: "CloudFormation Secrets Manager secret without rotation rules",
-			cwe:         "CWE-324", keywords: []string{"AWS::SecretsManager::Secret", "RotationRules"},
+			absenceAnchor:   `(?i)AWS::SecretsManager::Secret\b`,
+			absenceProperty: `(?i)RotationRules|RotationSchedule`,
+			absenceSpan:     "file",
+			description:     "CloudFormation Secrets Manager secret without rotation rules",
+			cwe:             "CWE-324", keywords: []string{"AWS::SecretsManager::Secret", "RotationRules"},
 			filePatterns: []string{"*.template", "*.json", "*.yaml", "*.yml"},
 			tags:         []string{"iac", "cloudformation", "aws", "secrets"},
 			remediation:  "Add RotationRules with AutomaticallyAfterDays to Secrets Manager secrets. Automatic rotation limits the lifetime of compromised credentials.",
@@ -854,9 +961,13 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-080", severity: findings.SeverityMedium, confidence: findings.ConfidenceLow,
-			pattern:     `(?i)AWS::StepFunctions::StateMachine(?:[^}](?!LoggingConfiguration))*\}`,
-			description: "CloudFormation Step Functions state machine without logging configuration",
-			cwe:         "CWE-778", keywords: []string{"AWS::StepFunctions::StateMachine", "LoggingConfiguration"},
+			absenceAnchor:        `(?i)AWS::StepFunctions::StateMachine`,
+			absenceProperty:      `(?i)LoggingConfiguration`,
+			absenceSpan:          "brace-enclosing",
+			absenceResourceTypes: []string{"AWS::StepFunctions::StateMachine"},
+			absencePropertyPath:  []string{"Properties.LoggingConfiguration"},
+			description:          "CloudFormation Step Functions state machine without logging configuration",
+			cwe:                  "CWE-778", keywords: []string{"AWS::StepFunctions::StateMachine", "LoggingConfiguration"},
 			filePatterns: []string{"*.template", "*.json", "*.yaml", "*.yml"},
 			tags:         []string{"iac", "cloudformation", "aws", "logging"},
 			remediation:  "Add LoggingConfiguration with level set to ALL or ERROR to Step Functions state machines. Logging is essential for debugging and auditing workflow executions.",
@@ -878,9 +989,13 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-082", severity: findings.SeverityHigh, confidence: findings.ConfidenceLow,
-			pattern:     `(?i)Microsoft\.Storage/storageAccounts(?:[^}](?!encryption))*\}`,
-			description: "Azure storage account missing encryption configuration",
-			cwe:         "CWE-311", keywords: []string{"Microsoft.Storage/storageAccounts", "encryption"},
+			absenceAnchor:        `(?i)Microsoft\.Storage/storageAccounts`,
+			absenceProperty:      `(?i)encryption`,
+			absenceSpan:          "brace-enclosing",
+			absenceResourceTypes: []string{"Microsoft.Storage/storageAccounts"},
+			absencePropertyPath:  []string{"properties.encryption"},
+			description:          "Azure storage account missing encryption configuration",
+			cwe:                  "CWE-311", keywords: []string{"Microsoft.Storage/storageAccounts", "encryption"},
 			filePatterns: []string{"*.json", "azuredeploy.json", "*.bicep"},
 			tags:         []string{"iac", "arm", "azure", "encryption"},
 			remediation:  "Configure encryption services for blob, file, table, and queue storage. Use Microsoft-managed or customer-managed keys for encryption at rest.",
@@ -898,9 +1013,11 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-084", severity: findings.SeverityHigh, confidence: findings.ConfidenceLow,
-			pattern:     `(?i)Microsoft\.Sql/servers(?:[^}](?!auditingSettings))*\}`,
-			description: "Azure SQL Server without auditing settings",
-			cwe:         "CWE-778", keywords: []string{"Microsoft.Sql/servers", "auditingSettings"},
+			absenceAnchor:   `(?i)Microsoft\.Sql/servers`,
+			absenceProperty: `(?i)auditingSettings`,
+			absenceSpan:     "file",
+			description:     "Azure SQL Server without auditing settings",
+			cwe:             "CWE-778", keywords: []string{"Microsoft.Sql/servers", "auditingSettings"},
 			filePatterns: []string{"*.json", "azuredeploy.json", "*.bicep"},
 			tags:         []string{"iac", "arm", "azure", "database", "logging"},
 			remediation:  "Enable auditing on Azure SQL Server with a retention period of at least 90 days. Send audit logs to a storage account or Log Analytics workspace.",
@@ -918,9 +1035,11 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-086", severity: findings.SeverityMedium, confidence: findings.ConfidenceLow,
-			pattern:     `(?i)Microsoft\.Sql/servers(?:[^}](?!firewallRules))*\}`,
-			description: "Azure SQL Server without firewall rules",
-			cwe:         "CWE-284", keywords: []string{"Microsoft.Sql/servers", "firewallRules"},
+			absenceAnchor:   `(?i)Microsoft\.Sql/servers`,
+			absenceProperty: `(?i)firewallRules`,
+			absenceSpan:     "file",
+			description:     "Azure SQL Server without firewall rules",
+			cwe:             "CWE-284", keywords: []string{"Microsoft.Sql/servers", "firewallRules"},
 			filePatterns: []string{"*.json", "azuredeploy.json", "*.bicep"},
 			tags:         []string{"iac", "arm", "azure", "database", "network"},
 			remediation:  "Configure firewall rules to restrict SQL Server access to specific IP ranges. Avoid using 0.0.0.0 as start IP which allows all Azure services.",
@@ -978,9 +1097,13 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-092", severity: findings.SeverityMedium, confidence: findings.ConfidenceLow,
-			pattern:     `(?i)Microsoft\.Web/sites(?:[^}](?!identity))*\}`,
-			description: "Azure App Service without managed identity",
-			cwe:         "CWE-798", keywords: []string{"Microsoft.Web/sites", "identity"},
+			absenceAnchor:        `(?i)Microsoft\.Web/sites`,
+			absenceProperty:      `(?i)identity`,
+			absenceSpan:          "brace-enclosing",
+			absenceResourceTypes: []string{"Microsoft.Web/sites"},
+			absencePropertyPath:  []string{"identity"},
+			description:          "Azure App Service without managed identity",
+			cwe:                  "CWE-798", keywords: []string{"Microsoft.Web/sites", "identity"},
 			filePatterns: []string{"*.json", "azuredeploy.json", "*.bicep"},
 			tags:         []string{"iac", "arm", "azure", "authentication"},
 			remediation:  "Add a managed identity (SystemAssigned or UserAssigned) to App Services. Managed identities eliminate the need for credentials in code.",
@@ -998,9 +1121,13 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-094", severity: findings.SeverityMedium, confidence: findings.ConfidenceLow,
-			pattern:     `(?i)Microsoft\.ContainerService/managedClusters(?:[^}](?!networkPolicy))*\}`,
-			description: "Azure AKS cluster without network policy",
-			cwe:         "CWE-284", keywords: []string{"networkPolicy", "managedClusters"},
+			absenceAnchor:        `(?i)Microsoft\.ContainerService/managedClusters`,
+			absenceProperty:      `(?i)networkPolicy`,
+			absenceSpan:          "brace-enclosing",
+			absenceResourceTypes: []string{"Microsoft.ContainerService/managedClusters"},
+			absencePropertyPath:  []string{"properties.networkProfile.networkPolicy"},
+			description:          "Azure AKS cluster without network policy",
+			cwe:                  "CWE-284", keywords: []string{"networkPolicy", "managedClusters"},
 			filePatterns: []string{"*.json", "azuredeploy.json", "*.bicep"},
 			tags:         []string{"iac", "arm", "azure", "kubernetes", "network"},
 			remediation:  "Configure networkPolicy (azure or calico) in the AKS network profile. Network policies control pod-to-pod traffic and enforce network segmentation.",
@@ -1008,9 +1135,13 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-095", severity: findings.SeverityMedium, confidence: findings.ConfidenceLow,
-			pattern:     `(?i)Microsoft\.ContainerService/managedClusters(?:[^}](?!aadProfile))*\}`,
-			description: "Azure AKS cluster without AAD integration",
-			cwe:         "CWE-306", keywords: []string{"aadProfile", "managedClusters"},
+			absenceAnchor:        `(?i)Microsoft\.ContainerService/managedClusters`,
+			absenceProperty:      `(?i)aadProfile`,
+			absenceSpan:          "brace-enclosing",
+			absenceResourceTypes: []string{"Microsoft.ContainerService/managedClusters"},
+			absencePropertyPath:  []string{"properties.aadProfile"},
+			description:          "Azure AKS cluster without AAD integration",
+			cwe:                  "CWE-306", keywords: []string{"aadProfile", "managedClusters"},
 			filePatterns: []string{"*.json", "azuredeploy.json", "*.bicep"},
 			tags:         []string{"iac", "arm", "azure", "kubernetes", "authentication"},
 			remediation:  "Configure aadProfile on AKS clusters to integrate with Azure Active Directory. AAD provides centralized identity management and conditional access.",
@@ -1018,9 +1149,12 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-096", severity: findings.SeverityMedium, confidence: findings.ConfidenceLow,
-			pattern:     `(?i)Microsoft\.Web/sites.*kind.*functionapp(?:[^}](?!identity))*\}`,
-			description: "Azure Function App without managed identity",
-			cwe:         "CWE-798", keywords: []string{"functionapp", "identity"},
+			absenceAnchor:   `(?i)Microsoft\.Web/sites`,
+			absenceRequire:  `(?i)functionapp`,
+			absenceProperty: `(?i)identity`,
+			absenceSpan:     "brace-enclosing",
+			description:     "Azure Function App without managed identity",
+			cwe:             "CWE-798", keywords: []string{"functionapp", "identity"},
 			filePatterns: []string{"*.json", "azuredeploy.json", "*.bicep"},
 			tags:         []string{"iac", "arm", "azure", "authentication"},
 			remediation:  "Add a managed identity to Function Apps. Use managed identities to securely access Key Vault, Storage, and other Azure services without storing credentials.",
@@ -1028,9 +1162,13 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-097", severity: findings.SeverityMedium, confidence: findings.ConfidenceLow,
-			pattern:     `(?i)Microsoft\.DocumentDB/databaseAccounts(?:[^}](?!virtualNetworkRules|isVirtualNetworkFilterEnabled))*\}`,
-			description: "Azure Cosmos DB without network restrictions",
-			cwe:         "CWE-284", keywords: []string{"DocumentDB", "virtualNetworkRules"},
+			absenceAnchor:        `(?i)Microsoft\.DocumentDB/databaseAccounts`,
+			absenceProperty:      `(?i)virtualNetworkRules|isVirtualNetworkFilterEnabled`,
+			absenceSpan:          "brace-enclosing",
+			absenceResourceTypes: []string{"Microsoft.DocumentDB/databaseAccounts"},
+			absencePropertyPath:  []string{"properties.isVirtualNetworkFilterEnabled", "properties.virtualNetworkRules"},
+			description:          "Azure Cosmos DB without network restrictions",
+			cwe:                  "CWE-284", keywords: []string{"DocumentDB", "virtualNetworkRules"},
 			filePatterns: []string{"*.json", "azuredeploy.json", "*.bicep"},
 			tags:         []string{"iac", "arm", "azure", "database", "network"},
 			remediation:  "Configure virtualNetworkRules and set isVirtualNetworkFilterEnabled to true to restrict Cosmos DB access to specific virtual networks.",
@@ -1038,9 +1176,13 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-098", severity: findings.SeverityHigh, confidence: findings.ConfidenceLow,
-			pattern:     `(?i)Microsoft\.Compute/virtualMachines(?:[^}](?!diskEncryptionSet|encryptionAtHost))*\}`,
-			description: "Azure VM without disk encryption",
-			cwe:         "CWE-311", keywords: []string{"virtualMachines", "diskEncryptionSet"},
+			absenceAnchor:        `(?i)Microsoft\.Compute/virtualMachines`,
+			absenceProperty:      `(?i)diskEncryptionSet|encryptionAtHost`,
+			absenceSpan:          "brace-enclosing",
+			absenceResourceTypes: []string{"Microsoft.Compute/virtualMachines"},
+			absencePropertyPath:  []string{"properties.securityProfile.encryptionAtHost", "properties.storageProfile.osDisk.managedDisk.diskEncryptionSet"},
+			description:          "Azure VM without disk encryption",
+			cwe:                  "CWE-311", keywords: []string{"virtualMachines", "diskEncryptionSet"},
 			filePatterns: []string{"*.json", "azuredeploy.json", "*.bicep"},
 			tags:         []string{"iac", "arm", "azure", "encryption"},
 			remediation:  "Enable Azure Disk Encryption or encryption at host for virtual machines. Disk encryption protects data at rest from unauthorized access to physical storage.",
@@ -1048,9 +1190,13 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-099", severity: findings.SeverityMedium, confidence: findings.ConfidenceLow,
-			pattern:     `(?i)Microsoft\.ContainerRegistry/registries(?:[^}](?!trustPolicy|contentTrust))*\}`,
-			description: "Azure Container Registry without content trust",
-			cwe:         "CWE-829", keywords: []string{"ContainerRegistry", "trustPolicy"},
+			absenceAnchor:        `(?i)Microsoft\.ContainerRegistry/registries`,
+			absenceProperty:      `(?i)trustPolicy|contentTrust`,
+			absenceSpan:          "brace-enclosing",
+			absenceResourceTypes: []string{"Microsoft.ContainerRegistry/registries"},
+			absencePropertyPath:  []string{"properties.policies.trustPolicy"},
+			description:          "Azure Container Registry without content trust",
+			cwe:                  "CWE-829", keywords: []string{"ContainerRegistry", "trustPolicy"},
 			filePatterns: []string{"*.json", "azuredeploy.json", "*.bicep"},
 			tags:         []string{"iac", "arm", "azure", "supply-chain"},
 			remediation:  "Enable content trust on Azure Container Registry to ensure only signed images are pulled. This protects against tampered container images.",
@@ -1058,9 +1204,13 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-100", severity: findings.SeverityMedium, confidence: findings.ConfidenceLow,
-			pattern:     `(?i)Microsoft\.Network/applicationGateways(?:[^}](?!firewallPolicy|webApplicationFirewallConfiguration))*\}`,
-			description: "Azure Application Gateway without WAF",
-			cwe:         "CWE-693", keywords: []string{"applicationGateways", "firewallPolicy"},
+			absenceAnchor:        `(?i)Microsoft\.Network/applicationGateways`,
+			absenceProperty:      `(?i)firewallPolicy|webApplicationFirewallConfiguration`,
+			absenceSpan:          "brace-enclosing",
+			absenceResourceTypes: []string{"Microsoft.Network/applicationGateways"},
+			absencePropertyPath:  []string{"properties.firewallPolicy", "properties.webApplicationFirewallConfiguration"},
+			description:          "Azure Application Gateway without WAF",
+			cwe:                  "CWE-693", keywords: []string{"applicationGateways", "firewallPolicy"},
 			filePatterns: []string{"*.json", "azuredeploy.json", "*.bicep"},
 			tags:         []string{"iac", "arm", "azure", "waf"},
 			remediation:  "Associate a WAF policy with Application Gateway or use WAF_v2 SKU with webApplicationFirewallConfiguration. WAF protects against OWASP Top 10 threats.",
@@ -1068,9 +1218,13 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-101", severity: findings.SeverityMedium, confidence: findings.ConfidenceLow,
-			pattern:     `(?i)Microsoft\.ServiceBus/namespaces(?:[^}](?!encryption))*\}`,
-			description: "Azure Service Bus namespace without encryption",
-			cwe:         "CWE-311", keywords: []string{"ServiceBus", "encryption"},
+			absenceAnchor:        `(?i)Microsoft\.ServiceBus/namespaces`,
+			absenceProperty:      `(?i)encryption`,
+			absenceSpan:          "brace-enclosing",
+			absenceResourceTypes: []string{"Microsoft.ServiceBus/namespaces"},
+			absencePropertyPath:  []string{"properties.encryption"},
+			description:          "Azure Service Bus namespace without encryption",
+			cwe:                  "CWE-311", keywords: []string{"ServiceBus", "encryption"},
 			filePatterns: []string{"*.json", "azuredeploy.json", "*.bicep"},
 			tags:         []string{"iac", "arm", "azure", "encryption"},
 			remediation:  "Enable customer-managed key encryption on Service Bus namespaces for sensitive messaging workloads. Premium tier supports CMK encryption.",
@@ -1078,9 +1232,13 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-102", severity: findings.SeverityMedium, confidence: findings.ConfidenceLow,
-			pattern:     `(?i)Microsoft\.EventHub/namespaces(?:[^}](?!encryption))*\}`,
-			description: "Azure Event Hub namespace without encryption",
-			cwe:         "CWE-311", keywords: []string{"EventHub", "encryption"},
+			absenceAnchor:        `(?i)Microsoft\.EventHub/namespaces`,
+			absenceProperty:      `(?i)encryption`,
+			absenceSpan:          "brace-enclosing",
+			absenceResourceTypes: []string{"Microsoft.EventHub/namespaces"},
+			absencePropertyPath:  []string{"properties.encryption"},
+			description:          "Azure Event Hub namespace without encryption",
+			cwe:                  "CWE-311", keywords: []string{"EventHub", "encryption"},
 			filePatterns: []string{"*.json", "azuredeploy.json", "*.bicep"},
 			tags:         []string{"iac", "arm", "azure", "encryption"},
 			remediation:  "Enable customer-managed key encryption on Event Hub namespaces. Use dedicated or premium tier for CMK support on streaming data.",
@@ -1098,9 +1256,13 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-104", severity: findings.SeverityHigh, confidence: findings.ConfidenceLow,
-			pattern:     `(?i)Microsoft\.Compute/disks(?:[^}](?!encryption|diskEncryptionSet))*\}`,
-			description: "Azure managed disk without encryption",
-			cwe:         "CWE-311", keywords: []string{"Microsoft.Compute/disks", "encryption"},
+			absenceAnchor:        `(?i)Microsoft\.Compute/disks`,
+			absenceProperty:      `(?i)encryption|diskEncryptionSet`,
+			absenceSpan:          "brace-enclosing",
+			absenceResourceTypes: []string{"Microsoft.Compute/disks"},
+			absencePropertyPath:  []string{"properties.encryption", "properties.encryptionSettingsCollection"},
+			description:          "Azure managed disk without encryption",
+			cwe:                  "CWE-311", keywords: []string{"Microsoft.Compute/disks", "encryption"},
 			filePatterns: []string{"*.json", "azuredeploy.json", "*.bicep"},
 			tags:         []string{"iac", "arm", "azure", "encryption"},
 			remediation:  "Configure encryption with a customer-managed key or enable server-side encryption with platform-managed keys on managed disks.",
@@ -1142,9 +1304,11 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-108", severity: findings.SeverityMedium, confidence: findings.ConfidenceLow,
-			pattern:     `(?i)google_storage_bucket(?:[^}](?!default_kms_key_name|kmsKeyName))*\}`,
-			description: "GCP Cloud Storage bucket without customer-managed encryption key",
-			cwe:         "CWE-311", keywords: []string{"google_storage_bucket", "default_kms_key_name"},
+			absenceAnchor:   `(?i)google_storage_bucket`,
+			absenceProperty: `(?i)default_kms_key_name|kmsKeyName`,
+			absenceSpan:     "brace-block",
+			description:     "GCP Cloud Storage bucket without customer-managed encryption key",
+			cwe:             "CWE-311", keywords: []string{"google_storage_bucket", "default_kms_key_name"},
 			filePatterns: []string{"*.tf", "*.yaml", "*.yml", "*.json"},
 			tags:         []string{"iac", "gcp", "encryption"},
 			remediation:  "Set default_kms_key_name on GCS buckets to use a Cloud KMS key for encryption. While Google encrypts by default, CMEK gives you control over the encryption key lifecycle.",
@@ -1177,6 +1341,7 @@ func builtinBaseIaCRules() []rules.Rule {
 			cwe:         "CWE-693", keywords: []string{"enable_secure_boot", "enableSecureBoot"},
 			filePatterns: []string{"*.tf", "*.yaml", "*.yml", "*.json"},
 			tags:         []string{"iac", "gcp", "integrity"},
+			retires:      []rules.RetiredRule{{ID: "IAC-333", Pattern: `(?i)enable_secure_boot\s*=\s*false`}},
 			remediation:  "Enable Shielded VM features (secure boot, vTPM, integrity monitoring) on compute instances. Shielded VMs protect against rootkits and boot-level malware.",
 			references:   []string{"https://cwe.mitre.org/data/definitions/693.html"},
 		},
@@ -1192,9 +1357,11 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-113", severity: findings.SeverityHigh, confidence: findings.ConfidenceLow,
-			pattern:     `(?i)google_container_cluster(?:[^}](?!workload_identity_config|workloadIdentityConfig))*\}`,
-			description: "GCP GKE cluster without workload identity",
-			cwe:         "CWE-798", keywords: []string{"google_container_cluster", "workload_identity_config"},
+			absenceAnchor:   `(?i)google_container_cluster`,
+			absenceProperty: `(?i)workload_identity_config|workloadIdentityConfig`,
+			absenceSpan:     "brace-block",
+			description:     "GCP GKE cluster without workload identity",
+			cwe:             "CWE-798", keywords: []string{"google_container_cluster", "workload_identity_config"},
 			filePatterns: []string{"*.tf", "*.yaml", "*.yml", "*.json"},
 			tags:         []string{"iac", "gcp", "kubernetes", "authentication"},
 			remediation:  "Enable Workload Identity on GKE clusters to allow pods to authenticate to Google APIs using Kubernetes service accounts instead of static credentials.",
@@ -1227,6 +1394,7 @@ func builtinBaseIaCRules() []rules.Rule {
 			cwe:         "CWE-319", keywords: []string{"require_ssl", "requireSsl"},
 			filePatterns: []string{"*.tf", "*.yaml", "*.yml", "*.json"},
 			tags:         []string{"iac", "gcp", "database", "encryption"},
+			retires:      []rules.RetiredRule{{ID: "IAC-337", Pattern: `(?i)require_ssl\s*=\s*false`}},
 			remediation:  "Set require_ssl to true to enforce SSL connections to Cloud SQL instances. Unencrypted connections expose database traffic to eavesdropping.",
 			references:   []string{"https://cwe.mitre.org/data/definitions/319.html"},
 		},
@@ -1252,9 +1420,11 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-119", severity: findings.SeverityMedium, confidence: findings.ConfidenceLow,
-			pattern:     `(?i)google_kms_crypto_key(?:[^}](?!rotation_period))*\}`,
-			description: "GCP Cloud KMS key without rotation period",
-			cwe:         "CWE-324", keywords: []string{"google_kms_crypto_key", "rotation_period"},
+			absenceAnchor:   `(?i)google_kms_crypto_key`,
+			absenceProperty: `(?i)rotation_period`,
+			absenceSpan:     "brace-block",
+			description:     "GCP Cloud KMS key without rotation period",
+			cwe:             "CWE-324", keywords: []string{"google_kms_crypto_key", "rotation_period"},
 			filePatterns: []string{"*.tf", "*.yaml", "*.yml", "*.json"},
 			tags:         []string{"iac", "gcp", "encryption"},
 			remediation:  "Set rotation_period on Cloud KMS keys (e.g., 7776000s for 90 days). Regular key rotation limits the amount of data encrypted under a single key version.",
@@ -1276,9 +1446,15 @@ func builtinBaseIaCRules() []rules.Rule {
 		// =================================================================
 		{
 			id: "IAC-121", severity: findings.SeverityMedium, confidence: findings.ConfidenceLow,
-			pattern:     `(?im)^FROM\s+.+(?:\n(?!.*HEALTHCHECK))*$`,
-			description: "Dockerfile missing HEALTHCHECK instruction",
-			cwe:         "CWE-693", keywords: []string{"HEALTHCHECK"},
+			absenceAnchor: `(?im)^[ \t]*FROM\s+\S`,
+			// Anchored to a real HEALTHCHECK instruction at line start, not the
+			// bare keyword: an unanchored match treated `# ... HEALTHCHECK ...`
+			// in a comment as the instruction being present and silenced the
+			// rule. Mirrors IAC-122's USER and IAC-125's CMD anchoring.
+			absenceProperty: `(?im)^\s*HEALTHCHECK\s`,
+			absenceSpan:     "file",
+			description:     "Dockerfile missing HEALTHCHECK instruction",
+			cwe:             "CWE-693", keywords: []string{"HEALTHCHECK"},
 			filePatterns: []string{"Dockerfile", "Dockerfile.*", "*.dockerfile"},
 			tags:         []string{"iac", "docker", "best-practice"},
 			remediation:  "Add a HEALTHCHECK instruction to Dockerfiles (e.g., HEALTHCHECK --interval=30s CMD curl -f http://localhost/ || exit 1). This enables container orchestrators to detect unhealthy containers.",
@@ -1286,9 +1462,11 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-122", severity: findings.SeverityMedium, confidence: findings.ConfidenceLow,
-			pattern:     `(?im)^FROM\s+.+(?:\n(?!.*\bUSER\b))*$`,
-			description: "Dockerfile has no USER instruction (runs as root by default)",
-			cwe:         "CWE-250", keywords: []string{"USER", "FROM"},
+			absenceAnchor:   `(?im)^[ \t]*FROM\s+\S`,
+			absenceProperty: `(?im)^\s*USER\s+\S`,
+			absenceSpan:     "file",
+			description:     "Dockerfile has no USER instruction (runs as root by default)",
+			cwe:             "CWE-250", keywords: []string{"USER", "FROM"},
 			filePatterns: []string{"Dockerfile", "Dockerfile.*", "*.dockerfile"},
 			tags:         []string{"iac", "docker", "privilege"},
 			remediation:  "Add a USER instruction to switch to a non-root user. Create the user with RUN adduser --disabled-password --gecos '' appuser and then USER appuser.",
@@ -1296,9 +1474,11 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-123", severity: findings.SeverityLow, confidence: findings.ConfidenceLow,
-			pattern:     `(?im)^\s*COPY\s+(?!.*--chown).*\S+\s+\S+`,
-			description: "Dockerfile COPY without --chown flag",
-			cwe:         "CWE-732", keywords: []string{"COPY"},
+			absenceAnchor:   `(?im)^[ \t]*COPY\s+\S+\s+\S`,
+			absenceProperty: `(?i)--chown`,
+			absenceSpan:     "line-continued",
+			description:     "Dockerfile COPY without --chown flag",
+			cwe:             "CWE-732", keywords: []string{"COPY"},
 			filePatterns: []string{"Dockerfile", "Dockerfile.*", "*.dockerfile"},
 			tags:         []string{"iac", "docker", "permissions"},
 			remediation:  "Use COPY --chown=user:group to set proper file ownership during copy. Without --chown, copied files are owned by root regardless of the USER instruction.",
@@ -1306,9 +1486,14 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-124", severity: findings.SeverityLow, confidence: findings.ConfidenceLow,
-			pattern:     `(?im)^FROM\s+.+(?:\n(?!.*LABEL\s+maintainer))*$`,
-			description: "Dockerfile missing LABEL maintainer",
-			cwe:         "CWE-1059", keywords: []string{"LABEL", "maintainer"},
+			absenceAnchor: `(?im)^[ \t]*FROM\s+\S`,
+			// Anchored to a real LABEL instruction at line start: an unanchored
+			// match let `# LABEL maintainer is deprecated` in a comment satisfy
+			// the rule. Same false-negative class as IAC-121.
+			absenceProperty: `(?im)^\s*LABEL\s+maintainer`,
+			absenceSpan:     "file",
+			description:     "Dockerfile missing LABEL maintainer",
+			cwe:             "CWE-1059", keywords: []string{"LABEL", "maintainer"},
 			filePatterns: []string{"Dockerfile", "Dockerfile.*", "*.dockerfile"},
 			tags:         []string{"iac", "docker", "best-practice"},
 			remediation:  "Add LABEL maintainer=\"team@example.com\" to identify the image maintainer. This aids in vulnerability response and image lifecycle management.", // nox:ignore DATA-001 -- example email in remediation text
@@ -1316,9 +1501,11 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-125", severity: findings.SeverityLow, confidence: findings.ConfidenceMedium,
-			pattern:     `(?im)^\s*CMD\s+(?!\[)`,
-			description: "Dockerfile CMD uses shell form instead of exec form",
-			cwe:         "CWE-78", keywords: []string{"CMD"},
+			absenceAnchor:   `(?im)^[ \t]*CMD\s+\S`,
+			absenceProperty: `(?im)^\s*CMD\s+\[`,
+			absenceSpan:     "line",
+			description:     "Dockerfile CMD uses shell form instead of exec form",
+			cwe:             "CWE-78", keywords: []string{"CMD"},
 			filePatterns: []string{"Dockerfile", "Dockerfile.*", "*.dockerfile"},
 			tags:         []string{"iac", "docker", "best-practice"},
 			remediation:  "Use exec form for CMD: CMD [\"executable\", \"param1\", \"param2\"]. Shell form runs via /bin/sh -c which does not receive signals properly and prevents graceful shutdown.",
@@ -1326,9 +1513,11 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-126", severity: findings.SeverityLow, confidence: findings.ConfidenceHigh,
-			pattern:     `(?im)^\s*RUN\s+.*apt-get\s+install(?!.*--no-install-recommends)`,
-			description: "Dockerfile apt-get install without --no-install-recommends",
-			cwe:         "CWE-1104", keywords: []string{"apt-get", "install"},
+			absenceAnchor:   `(?im)^[ \t]*RUN\s+.*apt-get\s+install`,
+			absenceProperty: `(?i)--no-install-recommends`,
+			absenceSpan:     "line-continued",
+			description:     "Dockerfile apt-get install without --no-install-recommends",
+			cwe:             "CWE-1104", keywords: []string{"apt-get", "install"},
 			filePatterns: []string{"Dockerfile", "Dockerfile.*", "*.dockerfile"},
 			tags:         []string{"iac", "docker", "best-practice"},
 			remediation:  "Add --no-install-recommends to apt-get install to minimize installed packages. Fewer packages mean a smaller attack surface and smaller image size.",
@@ -1336,9 +1525,11 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-127", severity: findings.SeverityLow, confidence: findings.ConfidenceHigh,
-			pattern:     `(?im)^\s*RUN\s+.*pip\s+install(?!.*--no-cache-dir)`,
-			description: "Dockerfile pip install without --no-cache-dir",
-			cwe:         "CWE-1104", keywords: []string{"pip", "install"},
+			absenceAnchor:   `(?im)^[ \t]*RUN\s+.*pip\s+install`,
+			absenceProperty: `(?i)--no-cache-dir`,
+			absenceSpan:     "line-continued",
+			description:     "Dockerfile pip install without --no-cache-dir",
+			cwe:             "CWE-1104", keywords: []string{"pip", "install"},
 			filePatterns: []string{"Dockerfile", "Dockerfile.*", "*.dockerfile"},
 			tags:         []string{"iac", "docker", "best-practice"},
 			remediation:  "Add --no-cache-dir to pip install to avoid caching downloaded packages in the image layer. This reduces image size without affecting functionality.",
@@ -1346,7 +1537,7 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-128", severity: findings.SeverityHigh, confidence: findings.ConfidenceHigh,
-			pattern:     `(?im)^\s*EXPOSE\s+22\b`,
+			pattern:     `(?im)^[ \t]*EXPOSE\s+22\b`,
 			description: "Dockerfile exposes SSH port 22",
 			cwe:         "CWE-284", keywords: []string{"EXPOSE", "22"},
 			filePatterns: []string{"Dockerfile", "Dockerfile.*", "*.dockerfile"},
@@ -1356,9 +1547,11 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-129", severity: findings.SeverityLow, confidence: findings.ConfidenceHigh,
-			pattern:     `(?im)^\s*RUN\s+.*apk\s+add(?!.*--no-cache)`,
-			description: "Dockerfile apk add without --no-cache",
-			cwe:         "CWE-1104", keywords: []string{"apk", "add"},
+			absenceAnchor:   `(?im)^[ \t]*RUN\s+.*apk\s+add`,
+			absenceProperty: `(?i)--no-cache`,
+			absenceSpan:     "line-continued",
+			description:     "Dockerfile apk add without --no-cache",
+			cwe:             "CWE-1104", keywords: []string{"apk", "add"},
 			filePatterns: []string{"Dockerfile", "Dockerfile.*", "*.dockerfile"},
 			tags:         []string{"iac", "docker", "best-practice"},
 			remediation:  "Use apk add --no-cache to avoid storing the package index in the image layer. This reduces image size without a separate rm command.",
@@ -1366,7 +1559,7 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-130", severity: findings.SeverityHigh, confidence: findings.ConfidenceMedium,
-			pattern:     `(?im)^\s*ENV\s+(PASSWORD|SECRET|TOKEN|API_KEY|PRIVATE_KEY|AWS_SECRET_ACCESS_KEY|DATABASE_PASSWORD|DB_PASSWORD)\s*=`,
+			pattern:     `(?im)^[ \t]*ENV\s+(PASSWORD|SECRET|TOKEN|API_KEY|PRIVATE_KEY|AWS_SECRET_ACCESS_KEY|DATABASE_PASSWORD|DB_PASSWORD)\s*=`,
 			description: "Dockerfile ENV sets a variable with a secret-like name",
 			cwe:         "CWE-798", keywords: []string{"ENV", "PASSWORD", "SECRET", "TOKEN", "API_KEY"},
 			filePatterns: []string{"Dockerfile", "Dockerfile.*", "*.dockerfile"},
@@ -1390,9 +1583,11 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-132", severity: findings.SeverityMedium, confidence: findings.ConfidenceLow,
-			pattern:     `(?i)kind\s*:\s*(Deployment|StatefulSet)(?:[^-](?!PodDisruptionBudget))*`,
-			description: "Kubernetes workload without PodDisruptionBudget",
-			cwe:         "CWE-693", keywords: []string{"PodDisruptionBudget"},
+			absenceAnchor:   `(?i)kind\s*:\s*(Deployment|StatefulSet)`,
+			absenceProperty: `(?i)PodDisruptionBudget`,
+			absenceSpan:     "file",
+			description:     "Kubernetes workload without PodDisruptionBudget",
+			cwe:             "CWE-693", keywords: []string{"PodDisruptionBudget"},
 			filePatterns: []string{"*.yaml", "*.yml"},
 			tags:         []string{"iac", "kubernetes", "availability"},
 			remediation:  "Create a PodDisruptionBudget for each Deployment and StatefulSet to ensure minimum availability during voluntary disruptions like node drains.",
@@ -1400,9 +1595,11 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-133", severity: findings.SeverityMedium, confidence: findings.ConfidenceLow,
-			pattern:     `(?i)kind\s*:\s*Namespace(?:[^-](?!ResourceQuota))*`,
-			description: "Kubernetes namespace without ResourceQuota",
-			cwe:         "CWE-770", keywords: []string{"Namespace", "ResourceQuota"},
+			absenceAnchor:   `(?i)kind\s*:\s*Namespace`,
+			absenceProperty: `(?i)ResourceQuota`,
+			absenceSpan:     "file",
+			description:     "Kubernetes namespace without ResourceQuota",
+			cwe:             "CWE-770", keywords: []string{"Namespace", "ResourceQuota"},
 			filePatterns: []string{"*.yaml", "*.yml"},
 			tags:         []string{"iac", "kubernetes", "resources"},
 			remediation:  "Create ResourceQuota objects for each namespace to prevent any single namespace from consuming excessive cluster resources.",
@@ -1410,9 +1607,11 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-134", severity: findings.SeverityMedium, confidence: findings.ConfidenceLow,
-			pattern:     `(?i)kind\s*:\s*Namespace(?:[^-](?!LimitRange))*`,
-			description: "Kubernetes namespace without LimitRange",
-			cwe:         "CWE-770", keywords: []string{"Namespace", "LimitRange"},
+			absenceAnchor:   `(?i)kind\s*:\s*Namespace`,
+			absenceProperty: `(?i)LimitRange`,
+			absenceSpan:     "file",
+			description:     "Kubernetes namespace without LimitRange",
+			cwe:             "CWE-770", keywords: []string{"Namespace", "LimitRange"},
 			filePatterns: []string{"*.yaml", "*.yml"},
 			tags:         []string{"iac", "kubernetes", "resources"},
 			remediation:  "Create LimitRange objects for namespaces to set default resource requests and limits for containers that do not specify their own.",
@@ -1420,9 +1619,11 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-135", severity: findings.SeverityMedium, confidence: findings.ConfidenceLow,
-			pattern:     `(?i)securityContext\s*:(?:[^}](?!seccompProfile))*\}`,
-			description: "Kubernetes pod security context missing seccomp profile",
-			cwe:         "CWE-250", keywords: []string{"seccompProfile", "securityContext"},
+			absenceAnchor:   `(?i)securityContext\s*:`,
+			absenceProperty: `(?i)seccompProfile`,
+			absenceSpan:     "yaml-block",
+			description:     "Kubernetes pod security context missing seccomp profile",
+			cwe:             "CWE-250", keywords: []string{"seccompProfile", "securityContext"},
 			filePatterns: []string{"*.yaml", "*.yml"},
 			tags:         []string{"iac", "kubernetes", "privilege"},
 			remediation:  "Add seccompProfile with type RuntimeDefault or Localhost to the pod security context. Seccomp profiles restrict available system calls, reducing the kernel attack surface.",
@@ -1440,9 +1641,14 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-137", severity: findings.SeverityMedium, confidence: findings.ConfidenceMedium,
-			pattern:     `(?i)containers\s*:\s*\n(\s+-\s+(?:(?!limits\s*:).)*$)+`,
-			description: "Kubernetes container without resource limits",
-			cwe:         "CWE-770", keywords: []string{"resources", "limits"},
+			absenceAnchor:        `(?i)containers\s*:`,
+			absenceProperty:      `(?i)limits\s*:`,
+			absenceSpan:          "yaml-block",
+			absenceResourceTypes: []string{"Deployment", "StatefulSet", "DaemonSet", "ReplicaSet", "Job", "CronJob", "Pod"},
+			absencePropertyPath:  []string{"spec.template.spec.containers[].resources.limits", "spec.containers[].resources.limits", "spec.jobTemplate.spec.template.spec.containers[].resources.limits"},
+			absenceRequireAll:    true,
+			description:          "Kubernetes container without resource limits",
+			cwe:                  "CWE-770", keywords: []string{"resources", "limits"},
 			filePatterns: []string{"*.yaml", "*.yml"},
 			tags:         []string{"iac", "kubernetes", "resources"},
 			remediation:  "Set resource limits (cpu, memory) on all containers. Without limits, a single container can consume all node resources, causing denial of service.",
@@ -1450,9 +1656,14 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-138", severity: findings.SeverityMedium, confidence: findings.ConfidenceMedium,
-			pattern:     `(?i)containers\s*:\s*\n(\s+-\s+(?:(?!requests\s*:).)*$)+`,
-			description: "Kubernetes container without resource requests",
-			cwe:         "CWE-770", keywords: []string{"resources", "requests"},
+			absenceAnchor:        `(?i)containers\s*:`,
+			absenceProperty:      `(?i)requests\s*:`,
+			absenceSpan:          "yaml-block",
+			absenceResourceTypes: []string{"Deployment", "StatefulSet", "DaemonSet", "ReplicaSet", "Job", "CronJob", "Pod"},
+			absencePropertyPath:  []string{"spec.template.spec.containers[].resources.requests", "spec.containers[].resources.requests", "spec.jobTemplate.spec.template.spec.containers[].resources.requests"},
+			absenceRequireAll:    true,
+			description:          "Kubernetes container without resource requests",
+			cwe:                  "CWE-770", keywords: []string{"resources", "requests"},
 			filePatterns: []string{"*.yaml", "*.yml"},
 			tags:         []string{"iac", "kubernetes", "resources"},
 			remediation:  "Set resource requests (cpu, memory) on all containers. Requests affect scheduling decisions and ensure the container gets guaranteed resources.",
@@ -1460,9 +1671,14 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-139", severity: findings.SeverityMedium, confidence: findings.ConfidenceLow,
-			pattern:     `(?i)containers\s*:\s*\n(\s+-\s+(?:(?!livenessProbe).)*$)+`,
-			description: "Kubernetes container without liveness probe",
-			cwe:         "CWE-693", keywords: []string{"livenessProbe"},
+			absenceAnchor:        `(?i)containers\s*:`,
+			absenceProperty:      `(?i)livenessProbe`,
+			absenceSpan:          "yaml-block",
+			absenceResourceTypes: []string{"Deployment", "StatefulSet", "DaemonSet", "ReplicaSet", "Job", "CronJob", "Pod"},
+			absencePropertyPath:  []string{"spec.template.spec.containers[].livenessProbe", "spec.containers[].livenessProbe", "spec.jobTemplate.spec.template.spec.containers[].livenessProbe"},
+			absenceRequireAll:    true,
+			description:          "Kubernetes container without liveness probe",
+			cwe:                  "CWE-693", keywords: []string{"livenessProbe"},
 			filePatterns: []string{"*.yaml", "*.yml"},
 			tags:         []string{"iac", "kubernetes", "availability"},
 			remediation:  "Add a livenessProbe to containers to enable Kubernetes to detect and restart unhealthy pods. Use HTTP, TCP, or exec probes appropriate for the application.",
@@ -1470,9 +1686,14 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-140", severity: findings.SeverityMedium, confidence: findings.ConfidenceLow,
-			pattern:     `(?i)containers\s*:\s*\n(\s+-\s+(?:(?!readinessProbe).)*$)+`,
-			description: "Kubernetes container without readiness probe",
-			cwe:         "CWE-693", keywords: []string{"readinessProbe"},
+			absenceAnchor:        `(?i)containers\s*:`,
+			absenceProperty:      `(?i)readinessProbe`,
+			absenceSpan:          "yaml-block",
+			absenceResourceTypes: []string{"Deployment", "StatefulSet", "DaemonSet", "ReplicaSet", "Job", "CronJob", "Pod"},
+			absencePropertyPath:  []string{"spec.template.spec.containers[].readinessProbe", "spec.containers[].readinessProbe", "spec.jobTemplate.spec.template.spec.containers[].readinessProbe"},
+			absenceRequireAll:    true,
+			description:          "Kubernetes container without readiness probe",
+			cwe:                  "CWE-693", keywords: []string{"readinessProbe"},
 			filePatterns: []string{"*.yaml", "*.yml"},
 			tags:         []string{"iac", "kubernetes", "availability"},
 			remediation:  "Add a readinessProbe to containers so Kubernetes only sends traffic to pods that are ready to serve requests. This prevents errors during startup and rolling updates.",
@@ -1480,7 +1701,12 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-141", severity: findings.SeverityMedium, confidence: findings.ConfidenceMedium,
-			pattern:     `(?im)replicas\s*:\s*1\s*$`,
+			// `\b` stops the Deployment rule from also claiming an HPA's
+			// `minReplicas: 1` (IAC-399) — and `maxReplicas`, `readyReplicas`
+			// and every other *Replicas key. A YAML key is always preceded by
+			// whitespace or a line start, so real `replicas: 1` matches are
+			// unaffected, matched text included.
+			pattern:     `(?im)\breplicas\s*:\s*1\s*$`,
 			description: "Kubernetes Deployment with single replica (no high availability)",
 			cwe:         "CWE-693", keywords: []string{"replicas"},
 			filePatterns: []string{"*.yaml", "*.yml"},
@@ -1490,9 +1716,13 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-142", severity: findings.SeverityLow, confidence: findings.ConfidenceLow,
-			pattern:     `(?i)kind\s*:\s*Deployment(?:[^-](?!podAntiAffinity|anti-affinity))*`,
-			description: "Kubernetes Deployment without pod anti-affinity rules",
-			cwe:         "CWE-693", keywords: []string{"podAntiAffinity"},
+			absenceAnchor:        `(?i)kind\s*:\s*Deployment`,
+			absenceProperty:      `(?i)podAntiAffinity|anti-affinity`,
+			absenceSpan:          "yaml-doc",
+			absenceResourceTypes: []string{"Deployment"},
+			absencePropertyPath:  []string{"spec.template.spec.affinity.podAntiAffinity"},
+			description:          "Kubernetes Deployment without pod anti-affinity rules",
+			cwe:                  "CWE-693", keywords: []string{"podAntiAffinity"},
 			filePatterns: []string{"*.yaml", "*.yml"},
 			tags:         []string{"iac", "kubernetes", "availability"},
 			remediation:  "Add podAntiAffinity rules to spread pods across nodes and availability zones. This prevents a single node failure from taking down all replicas.",
@@ -1520,9 +1750,14 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-145", severity: findings.SeverityMedium, confidence: findings.ConfidenceLow,
-			pattern:     `(?i)spec\s*:\s*\n\s+containers\s*:(?:[^}](?!securityContext))*`,
-			description: "Kubernetes pod without security context",
-			cwe:         "CWE-250", keywords: []string{"securityContext"},
+			absenceAnchor:        `(?i)containers\s*:`,
+			absenceProperty:      `(?i)securityContext`,
+			absenceSpan:          "yaml-block",
+			absenceResourceTypes: []string{"Deployment", "StatefulSet", "DaemonSet", "ReplicaSet", "Job", "CronJob", "Pod"},
+			absencePropertyPath:  []string{"spec.template.spec.securityContext", "spec.securityContext", "spec.template.spec.containers[].securityContext", "spec.containers[].securityContext", "spec.jobTemplate.spec.template.spec.containers[].securityContext"},
+			absenceRequireAll:    true,
+			description:          "Kubernetes pod without security context",
+			cwe:                  "CWE-250", keywords: []string{"securityContext"},
 			filePatterns: []string{"*.yaml", "*.yml"},
 			tags:         []string{"iac", "kubernetes", "privilege"},
 			remediation:  "Add a securityContext to pod and container specs. Set runAsNonRoot: true, readOnlyRootFilesystem: true, and drop ALL capabilities as a baseline.",
@@ -1530,9 +1765,11 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-146", severity: findings.SeverityHigh, confidence: findings.ConfidenceHigh,
-			pattern:     `(?i)hostPath\s*:\s*\n[^}]*(?!readOnly\s*:\s*true)`,
-			description: "Kubernetes hostPath volume without readOnly flag",
-			cwe:         "CWE-732", keywords: []string{"hostPath"},
+			absenceAnchor:   `(?i)hostPath\s*:`,
+			absenceProperty: `(?i)readOnly\s*:\s*true`,
+			absenceSpan:     "yaml-doc",
+			description:     "Kubernetes hostPath volume without readOnly flag",
+			cwe:             "CWE-732", keywords: []string{"hostPath"},
 			filePatterns: []string{"*.yaml", "*.yml"},
 			tags:         []string{"iac", "kubernetes", "filesystem"},
 			remediation:  "Set readOnly: true on hostPath volume mounts or avoid hostPath entirely. Writable hostPath mounts allow containers to modify host filesystem contents.",
@@ -1540,9 +1777,11 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-147", severity: findings.SeverityLow, confidence: findings.ConfidenceMedium,
-			pattern:     `(?i)emptyDir\s*:\s*\{\s*\}|emptyDir\s*:\s*\n\s+(?!sizeLimit)`,
-			description: "Kubernetes emptyDir volume without size limit",
-			cwe:         "CWE-770", keywords: []string{"emptyDir", "sizeLimit"},
+			absenceAnchor:   `(?i)emptyDir\s*:`,
+			absenceProperty: `(?i)sizeLimit`,
+			absenceSpan:     "yaml-block",
+			description:     "Kubernetes emptyDir volume without size limit",
+			cwe:             "CWE-770", keywords: []string{"emptyDir", "sizeLimit"},
 			filePatterns: []string{"*.yaml", "*.yml"},
 			tags:         []string{"iac", "kubernetes", "resources"},
 			remediation:  "Set sizeLimit on emptyDir volumes to prevent containers from consuming unbounded disk space on the node (e.g., emptyDir: {sizeLimit: 1Gi}).",
@@ -1550,9 +1789,13 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-148", severity: findings.SeverityLow, confidence: findings.ConfidenceLow,
-			pattern:     `(?i)kind\s*:\s*Service\s*\n(?:[^-](?!selector))*`,
-			description: "Kubernetes Service without selector",
-			cwe:         "CWE-284", keywords: []string{"Service", "selector"},
+			absenceAnchor:        `(?i)kind\s*:\s*Service\b`,
+			absenceProperty:      `(?i)selector`,
+			absenceSpan:          "yaml-doc",
+			absenceResourceTypes: []string{"Service"},
+			absencePropertyPath:  []string{"spec.selector"},
+			description:          "Kubernetes Service without selector",
+			cwe:                  "CWE-284", keywords: []string{"Service", "selector"},
 			filePatterns: []string{"*.yaml", "*.yml"},
 			tags:         []string{"iac", "kubernetes", "network"},
 			remediation:  "Verify Services without selectors are intentional (e.g., for ExternalName services or manual Endpoints). Accidental omission means no pods receive traffic.",
@@ -1560,9 +1803,13 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-149", severity: findings.SeverityHigh, confidence: findings.ConfidenceLow,
-			pattern:     `(?i)kind\s*:\s*Ingress(?:[^-](?!tls\s*:))*`,
-			description: "Kubernetes Ingress without TLS configuration",
-			cwe:         "CWE-319", keywords: []string{"Ingress", "tls"},
+			absenceAnchor:        `(?i)kind\s*:\s*Ingress\b`,
+			absenceProperty:      `(?i)tls\s*:`,
+			absenceSpan:          "yaml-doc",
+			absenceResourceTypes: []string{"Ingress"},
+			absencePropertyPath:  []string{"spec.tls"},
+			description:          "Kubernetes Ingress without TLS configuration",
+			cwe:                  "CWE-319", keywords: []string{"Ingress", "tls"},
 			filePatterns: []string{"*.yaml", "*.yml"},
 			tags:         []string{"iac", "kubernetes", "encryption"},
 			remediation:  "Add a tls section to Ingress resources with a valid TLS secret. Unencrypted ingress exposes user traffic to eavesdropping and modification.",
@@ -1594,7 +1841,7 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-152", severity: findings.SeverityLow, confidence: findings.ConfidenceLow,
-			pattern:     `(?im)^\s+steps\s*:\s*\n(\s+-\s+(uses|run)\s*:.*\n){15,}`,
+			pattern:     `(?im)^[ \t]+steps\s*:\s*\n(\s+-\s+(uses|run)\s*:.*\n){15,}`,
 			description: "GitHub Actions workflow has many steps - consider reusable workflows",
 			cwe:         "CWE-1059", keywords: []string{"steps", "uses"},
 			filePatterns: []string{"*.yml", "*.yaml"},
@@ -1604,9 +1851,11 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-153", severity: findings.SeverityMedium, confidence: findings.ConfidenceLow,
-			pattern:     `(?i)actions/upload-artifact(?!.*attestation)`,
-			description: "GitHub Actions artifact upload without attestation",
-			cwe:         "CWE-829", keywords: []string{"upload-artifact", "attestation"},
+			absenceAnchor:   `(?i)actions/upload-artifact`,
+			absenceProperty: `(?i)attest`,
+			absenceSpan:     "file",
+			description:     "GitHub Actions artifact upload without attestation",
+			cwe:             "CWE-829", keywords: []string{"upload-artifact", "attestation"},
 			filePatterns: []string{"*.yml", "*.yaml"},
 			tags:         []string{"iac", "github-actions", "supply-chain"},
 			remediation:  "Use artifact attestation (actions/attest-build-provenance) alongside upload-artifact to create SLSA-compliant provenance for build artifacts.",
@@ -1688,7 +1937,7 @@ func builtinBaseIaCRules() []rules.Rule {
 		// =================================================================
 		{
 			id: "IAC-161", severity: findings.SeverityMedium, confidence: findings.ConfidenceMedium,
-			pattern:     `(?im)^\s*provider\s+"[^"]+"\s*\{\s*$`,
+			pattern:     `(?im)^[ \t]*provider\s+"[^"]+"\s*\{\s*$`,
 			description: "Terraform provider without version constraints",
 			cwe:         "CWE-829", keywords: []string{"provider", "required_providers"},
 			filePatterns: []string{"*.tf"},
@@ -1698,9 +1947,11 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-162", severity: findings.SeverityHigh, confidence: findings.ConfidenceMedium,
-			pattern:     `(?i)backend\s+"s3"\s*\{(?:[^}](?!encrypt\s*=\s*true))*\}`,
-			description: "Terraform S3 backend without encryption",
-			cwe:         "CWE-311", keywords: []string{"backend", "encrypt"},
+			absenceAnchor:   `(?i)backend\s+"s3"`,
+			absenceProperty: `(?i)encrypt\s*=\s*true`,
+			absenceSpan:     "brace-block",
+			description:     "Terraform S3 backend without encryption",
+			cwe:             "CWE-311", keywords: []string{"backend", "encrypt"},
 			filePatterns: []string{"*.tf"},
 			tags:         []string{"iac", "terraform", "encryption"},
 			remediation:  "Set encrypt = true in the S3 backend configuration. State files contain sensitive information and must be encrypted at rest.",
@@ -1708,9 +1959,11 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-163", severity: findings.SeverityHigh, confidence: findings.ConfidenceMedium,
-			pattern:     `(?i)backend\s+"s3"\s*\{(?:[^}](?!dynamodb_table))*\}`,
-			description: "Terraform S3 backend without state locking (no DynamoDB table)",
-			cwe:         "CWE-362", keywords: []string{"backend", "dynamodb_table"},
+			absenceAnchor:   `(?i)backend\s+"s3"`,
+			absenceProperty: `(?i)dynamodb_table`,
+			absenceSpan:     "brace-block",
+			description:     "Terraform S3 backend without state locking (no DynamoDB table)",
+			cwe:             "CWE-362", keywords: []string{"backend", "dynamodb_table"},
 			filePatterns: []string{"*.tf"},
 			tags:         []string{"iac", "terraform", "state"},
 			remediation:  "Add dynamodb_table to the S3 backend configuration for state file locking. Without locking, concurrent terraform apply runs can corrupt state.",
@@ -1718,9 +1971,11 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-164", severity: findings.SeverityLow, confidence: findings.ConfidenceMedium,
-			pattern:     `(?im)^variable\s+"[^"]+"\s*\{\s*\n(?:[^}](?!validation\s*\{))*\}`,
-			description: "Terraform variable without validation block",
-			cwe:         "CWE-20", keywords: []string{"variable", "validation"},
+			absenceAnchor:   `(?im)^variable\s+"[^"]+"`,
+			absenceProperty: `(?i)validation\s*\{`,
+			absenceSpan:     "brace-block",
+			description:     "Terraform variable without validation block",
+			cwe:             "CWE-20", keywords: []string{"variable", "validation"},
 			filePatterns: []string{"*.tf"},
 			tags:         []string{"iac", "terraform", "best-practice"},
 			remediation:  "Add validation blocks to variables to enforce value constraints at plan time. Validation prevents invalid configurations from being applied.",
@@ -1748,9 +2003,11 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-167", severity: findings.SeverityMedium, confidence: findings.ConfidenceLow,
-			pattern:     `(?i)(aws_db_instance|aws_rds_cluster|aws_s3_bucket|google_sql_database_instance)(?:[^}](?!prevent_destroy\s*=\s*true))*\}`,
-			description: "Terraform data resource without lifecycle prevent_destroy",
-			cwe:         "CWE-693", keywords: []string{"prevent_destroy", "lifecycle"},
+			absenceAnchor:   `(?i)"(aws_db_instance|aws_rds_cluster|aws_s3_bucket|google_sql_database_instance)"`,
+			absenceProperty: `(?i)prevent_destroy\s*=\s*true`,
+			absenceSpan:     "brace-block",
+			description:     "Terraform data resource without lifecycle prevent_destroy",
+			cwe:             "CWE-693", keywords: []string{"prevent_destroy", "lifecycle"},
 			filePatterns: []string{"*.tf"},
 			tags:         []string{"iac", "terraform", "best-practice"},
 			remediation:  "Add lifecycle { prevent_destroy = true } to critical data resources (databases, storage). This prevents accidental deletion through terraform destroy.",
@@ -1758,9 +2015,11 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-168", severity: findings.SeverityHigh, confidence: findings.ConfidenceMedium,
-			pattern:     `(?i)source\s*=\s*"git::|source\s*=\s*"github\.com|source\s*=\s*"https://(?!.*\?ref=)`,
-			description: "Terraform module source not pinned to specific version or ref",
-			cwe:         "CWE-829", keywords: []string{"source", "module"},
+			absenceAnchor:   `(?i)source\s*=\s*"(git::|github\.com|https://)`,
+			absenceProperty: `(?i)\?ref=`,
+			absenceSpan:     "line",
+			description:     "Terraform module source not pinned to specific version or ref",
+			cwe:             "CWE-829", keywords: []string{"source", "module"},
 			filePatterns: []string{"*.tf"},
 			tags:         []string{"iac", "terraform", "supply-chain"},
 			remediation:  "Pin module sources to specific versions using ?ref=v1.0.0 for git sources or version constraints for registry modules. Unpinned modules may change unexpectedly.",
@@ -1768,9 +2027,11 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-169", severity: findings.SeverityMedium, confidence: findings.ConfidenceMedium,
-			pattern:     `(?i)terraform\s*\{(?:[^}](?!required_version))*\}`,
-			description: "Terraform configuration missing required_version",
-			cwe:         "CWE-829", keywords: []string{"required_version", "terraform"},
+			absenceAnchor:   `(?im)^[ \t]*terraform\b`,
+			absenceProperty: `(?i)required_version`,
+			absenceSpan:     "brace-block",
+			description:     "Terraform configuration missing required_version",
+			cwe:             "CWE-829", keywords: []string{"required_version", "terraform"},
 			filePatterns: []string{"*.tf"},
 			tags:         []string{"iac", "terraform", "best-practice"},
 			remediation:  "Add required_version to the terraform block (e.g., required_version = \">= 1.5.0\"). This prevents running with incompatible Terraform versions.",
@@ -1788,9 +2049,11 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-171", severity: findings.SeverityMedium, confidence: findings.ConfidenceMedium,
-			pattern:     `(?im)^output\s+"[^"]*(?:password|secret|token|key|credential)[^"]*"\s*\{(?:[^}](?!sensitive\s*=\s*true))*\}`,
-			description: "Terraform output with sensitive name not marked as sensitive",
-			cwe:         "CWE-532", keywords: []string{"output", "sensitive"},
+			absenceAnchor:   `(?im)^output\s+"[^"]*(?:password|secret|token|key|credential)[^"]*"`,
+			absenceProperty: `(?i)sensitive\s*=\s*true`,
+			absenceSpan:     "brace-block",
+			description:     "Terraform output with sensitive name not marked as sensitive",
+			cwe:             "CWE-532", keywords: []string{"output", "sensitive"},
 			filePatterns: []string{"*.tf"},
 			tags:         []string{"iac", "terraform", "secrets"},
 			remediation:  "Add sensitive = true to output blocks that contain secrets. Without this flag, sensitive values are displayed in terraform output and plan.",
@@ -1842,9 +2105,11 @@ func builtinBaseIaCRules() []rules.Rule {
 		// =================================================================
 		{
 			id: "IAC-176", severity: findings.SeverityMedium, confidence: findings.ConfidenceLow,
-			pattern:     `(?i)kind\s*:\s*Deployment(?:[^}](?!securityContext))*\}`,
-			description: "Helm chart template missing securityContext",
-			cwe:         "CWE-250", keywords: []string{"securityContext", "template"},
+			absenceAnchor:   `(?i)kind\s*:\s*Deployment`,
+			absenceProperty: `(?i)securityContext`,
+			absenceSpan:     "yaml-doc",
+			description:     "Helm chart template missing securityContext",
+			cwe:             "CWE-250", keywords: []string{"securityContext", "template"},
 			filePatterns: []string{"*.yaml", "*.yml", "*.tpl"},
 			tags:         []string{"iac", "helm", "privilege"},
 			remediation:  "Include securityContext in Helm chart deployment templates. Set runAsNonRoot: true, readOnlyRootFilesystem: true, and drop ALL capabilities as defaults.",
@@ -1912,9 +2177,11 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 		{
 			id: "IAC-183", severity: findings.SeverityMedium, confidence: findings.ConfidenceLow,
-			pattern:     `(?i)kind\s*:\s*(Deployment|StatefulSet)(?:[^}](?!PodDisruptionBudget|podDisruptionBudget))*`,
-			description: "Helm chart without PodDisruptionBudget template",
-			cwe:         "CWE-693", keywords: []string{"PodDisruptionBudget"},
+			absenceAnchor:   `(?i)kind\s*:\s*(Deployment|StatefulSet)`,
+			absenceProperty: `(?i)PodDisruptionBudget`,
+			absenceSpan:     "file",
+			description:     "Helm chart without PodDisruptionBudget template",
+			cwe:             "CWE-693", keywords: []string{"PodDisruptionBudget"},
 			filePatterns: []string{"*.yaml", "*.yml", "*.tpl"},
 			tags:         []string{"iac", "helm", "availability"},
 			remediation:  "Include a PodDisruptionBudget template in Helm charts to ensure minimum availability during voluntary disruptions like node upgrades and cluster autoscaling.",
@@ -1942,11 +2209,20 @@ func builtinBaseIaCRules() []rules.Rule {
 		},
 	}
 
+	return convertIaCRules(defs)
+}
+
+// convertIaCRules turns the compact iacRule table into rules.Rule values. A rule
+// with an absenceAnchor is wired to the "absence" matcher (block-scoped
+// hardening-property check); otherwise it uses the regex matcher. Absence rules
+// carry no Pattern, which is correct: their detection lives in the Absence*
+// fields, and leaving Pattern empty keeps them out of the regex-compile guard.
+func convertIaCRules(defs []iacRule) []rules.Rule {
 	out := make([]rules.Rule, len(defs))
 	for i := range defs {
 		md := map[string]string{"cwe": defs[i].cwe}
 		maps.Copy(md, defs[i].extraMetadata)
-		out[i] = rules.Rule{
+		r := rules.Rule{
 			ID:           defs[i].id,
 			Version:      "1.0",
 			Description:  defs[i].description,
@@ -1960,7 +2236,28 @@ func builtinBaseIaCRules() []rules.Rule {
 			Metadata:     md,
 			Remediation:  defs[i].remediation,
 			References:   defs[i].references,
+			Retires:      defs[i].retires,
 		}
+		if defs[i].absenceAnchor != "" {
+			r.MatcherType = "absence"
+			r.Pattern = ""
+			r.AbsenceAnchor = defs[i].absenceAnchor
+			r.AbsenceProperty = defs[i].absenceProperty
+			r.AbsenceRequire = defs[i].absenceRequire
+			r.AbsenceSpan = defs[i].absenceSpan
+			r.AbsenceResourceTypes = defs[i].absenceResourceTypes
+			r.AbsencePropertyPath = defs[i].absencePropertyPath
+			r.AbsenceRequireAll = defs[i].absenceRequireAll
+			// Absence rules must NOT be keyword-gated. The engine skips a rule
+			// when none of its keywords appear in the file, but these rules'
+			// keywords name the hardening property — which is precisely what is
+			// absent when the rule should fire. Keyword-gating them would skip
+			// the file exactly when it is misconfigured. The anchor regex is the
+			// gate instead: the matcher returns nothing when no resource anchor
+			// is present, so clearing keywords costs only a cheap no-op scan.
+			r.Keywords = nil
+		}
+		out[i] = r
 	}
 	return out
 }

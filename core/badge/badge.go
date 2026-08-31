@@ -4,8 +4,10 @@
 package badge
 
 import (
+	"encoding/xml"
 	"fmt"
 	"math"
+	"strings"
 
 	"github.com/nox-hq/nox/core/findings"
 )
@@ -79,21 +81,24 @@ var SeverityBadgeColors = map[findings.Severity]string{
 	findings.SeverityLow:      "#a3c51c",
 }
 
-// SeverityOrder defines the order in which severity badges are generated.
-var SeverityOrder = []findings.Severity{
-	findings.SeverityCritical,
-	findings.SeverityHigh,
-	findings.SeverityMedium,
-	findings.SeverityLow,
-}
-
-// CountBySeverity tallies findings by severity level.
-func CountBySeverity(ff []findings.Finding) map[findings.Severity]int {
-	counts := make(map[findings.Severity]int)
-	for i := range ff {
-		counts[ff[i].Severity]++
+// SeverityOrder is the order severity badges are generated in, derived from the
+// canonical findings.SeverityOrder and filtered to the severities that have a
+// badge colour. Deriving it rather than re-declaring means adding a severity
+// upstream cannot leave this list stale — it just needs a colour to appear.
+var SeverityOrder = func() []findings.Severity {
+	var out []findings.Severity
+	for _, s := range findings.SeverityOrder {
+		if _, ok := SeverityBadgeColors[s]; ok {
+			out = append(out, s)
+		}
 	}
-	return counts
+	return out
+}()
+
+// CountBySeverity tallies findings by severity level. It delegates to the
+// domain so badge, policy, and any other caller share one tally.
+func CountBySeverity(ff []findings.Finding) map[findings.Severity]int {
+	return findings.CountBySeverity(ff)
 }
 
 // SecurityScore computes a severity-weighted score from finding counts.
@@ -112,13 +117,13 @@ func SecurityScore(counts map[findings.Severity]int) int {
 // WeightedSecurityScore. Returned by Explain so users can see why their
 // grade is what it is — see issue #62 (`nox badge --explain`).
 type Contribution struct {
-	RuleID     string              `json:"rule_id"`
-	Severity   findings.Severity   `json:"severity"`
-	Confidence findings.Confidence `json:"confidence"`
-	SeverityW  int                 `json:"severity_weight"`
-	ConfidenceW float64            `json:"confidence_weight"`
-	Points     float64             `json:"points"`
-	Location   string              `json:"location,omitempty"`
+	RuleID      string              `json:"rule_id"`
+	Severity    findings.Severity   `json:"severity"`
+	Confidence  findings.Confidence `json:"confidence"`
+	SeverityW   int                 `json:"severity_weight"`
+	ConfidenceW float64             `json:"confidence_weight"`
+	Points      float64             `json:"points"`
+	Location    string              `json:"location,omitempty"`
 }
 
 // WeightedSecurityScore computes the score as
@@ -228,11 +233,25 @@ func SeverityBadges(ff []findings.Finding, label string) map[findings.Severity]*
 	return results
 }
 
+// escapeXML escapes text for safe inclusion in an SVG/XML attribute or element.
+func escapeXML(s string) string {
+	var b strings.Builder
+	_ = xml.EscapeText(&b, []byte(s))
+	return b.String()
+}
+
 // GenerateSVG produces an SVG badge string for the given label, value, and color.
 func GenerateSVG(label, value, color string) string {
+	// Widths are measured on the raw text (visual glyph count), but the text is
+	// XML-escaped before it goes into the SVG. A label containing '&', '<', '>'
+	// or '"' — a user-supplied --label — would otherwise produce malformed XML
+	// or allow markup injection into the badge.
 	labelW := textWidth(label) + 10
 	valueW := textWidth(value) + 10
 	totalW := labelW + valueW
+
+	label = escapeXML(label)
+	value = escapeXML(value)
 
 	// Text positions are in tenths of a pixel (SVG uses scale(.1)).
 	labelX := labelW * 10 / 2

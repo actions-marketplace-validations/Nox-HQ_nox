@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/nox-hq/nox/core/findings"
@@ -95,6 +96,72 @@ func TestGenerateContainsCorrectMeta(t *testing.T) {
 	}
 	if report.Meta.GeneratedAt == "" {
 		t.Error("expected GeneratedAt to be non-empty")
+	}
+}
+
+func TestGenerateOfflineAttestation(t *testing.T) {
+	// Default: a reporter records offline=false, so an artifact never over-claims
+	// a zero-network scan that wasn't one.
+	def, err := NewJSONReporter("1.0.0").Generate(sampleFindingSet())
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	var defReport JSONReport
+	if err := json.Unmarshal(def, &defReport); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if defReport.Meta.Offline {
+		t.Error("default reporter must record offline=false")
+	}
+
+	// With Offline set, the attestation appears in the artifact so a reviewer
+	// can confirm the scan touched no network straight from findings.json.
+	r := NewJSONReporter("1.0.0")
+	r.Offline = true
+	data, err := r.Generate(sampleFindingSet())
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	var report JSONReport
+	if err := json.Unmarshal(data, &report); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !report.Meta.Offline {
+		t.Error("offline reporter must record offline=true in meta")
+	}
+	if !bytes.Contains(data, []byte(`"offline": true`)) {
+		t.Errorf("findings.json meta must carry the offline attestation; got: %s", data)
+	}
+}
+
+func TestGenerateSASTLanguagesMeta(t *testing.T) {
+	// Default: no profile set, so the field is omitted from the artifact rather
+	// than emitting a null/empty object.
+	def, err := NewJSONReporter("1.0.0").Generate(sampleFindingSet())
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	if bytes.Contains(def, []byte("sast_languages")) {
+		t.Errorf("empty profile must be omitted from meta; got: %s", def)
+	}
+
+	// With a resolved profile, the depth strategy is recorded so a reviewer can
+	// audit which languages were scanned at which depth straight from the report.
+	r := NewJSONReporter("1.0.0")
+	r.SASTLanguages = map[string]string{"python": "deep", "go": "standard", "rust": "off"}
+	data, err := r.Generate(sampleFindingSet())
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	var report JSONReport
+	if err := json.Unmarshal(data, &report); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if report.Meta.SASTLanguages["python"] != "deep" {
+		t.Errorf("meta sast_languages[python] = %q, want deep", report.Meta.SASTLanguages["python"])
+	}
+	if report.Meta.SASTLanguages["rust"] != "off" {
+		t.Errorf("meta sast_languages[rust] = %q, want off", report.Meta.SASTLanguages["rust"])
 	}
 }
 
@@ -237,5 +304,103 @@ func TestWriteToFile_ErrorOnInvalidPath(t *testing.T) {
 	err := r.WriteToFile(fs, "/nonexistent/dir/report.json")
 	if err == nil {
 		t.Fatal("expected error writing to invalid path, got nil")
+	}
+}
+
+// Enrichments were populated on ScanResult and then dropped: no reporter
+// serialized them, so a post-scan plugin's entire output was computed and
+// discarded. That made a plugin which annotates rather than detects — the
+// correct shape for triage and threat-intel — indistinguishable from one that
+// never ran, for any consumer reading findings.json.
+func TestJSONReporter_SerializesEnrichments(t *testing.T) {
+	fs := findings.NewFindingSet()
+	r := NewJSONReporter("test")
+	r.Enrichments = []findings.Enrichment{{
+		FindingFingerprint: "abc123",
+		Kind:               "triage",
+		Title:              "Triage: immediate",
+		Body:               "**Priority: immediate**",
+		Metadata:           map[string]string{"priority": "immediate", "rank": "0"},
+		Source:             "nox/triage-agent",
+	}}
+
+	data, err := r.Generate(fs)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+
+	var got struct {
+		Enrichments []struct {
+			FindingFingerprint string            `json:"finding_fingerprint"`
+			Kind               string            `json:"kind"`
+			Metadata           map[string]string `json:"metadata"`
+			Source             string            `json:"source"`
+		} `json:"enrichments"`
+	}
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(got.Enrichments) != 1 {
+		t.Fatalf("expected the enrichment to reach the artifact, got %d", len(got.Enrichments))
+	}
+	e := got.Enrichments[0]
+	// The fingerprint is the whole link. Without it the annotation cannot be
+	// attached to anything, whatever else survives serialization.
+	if e.FindingFingerprint != "abc123" {
+		t.Errorf("finding_fingerprint = %q, want abc123", e.FindingFingerprint)
+	}
+	if e.Kind != "triage" || e.Source != "nox/triage-agent" {
+		t.Errorf("kind/source lost: %q / %q", e.Kind, e.Source)
+	}
+	if e.Metadata["priority"] != "immediate" {
+		t.Errorf("metadata lost: %v", e.Metadata)
+	}
+}
+
+// A scan with no post-scan plugins must be byte-identical to before, so the
+// key is omitted rather than emitted as null or [].
+func TestJSONReporter_OmitsEnrichmentsWhenEmpty(t *testing.T) {
+	data, err := NewJSONReporter("test").Generate(findings.NewFindingSet())
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	if strings.Contains(string(data), "enrichments") {
+		t.Errorf("empty enrichments must be omitted entirely, got:\n%s", data)
+	}
+}
+
+func TestLoadFindingsFileParsesTheRealArtifact(t *testing.T) {
+	// A real `nox scan` writes a JSON OBJECT ({meta, findings, ...}), not an
+	// array. The vex init loader had drifted to parsing an array, which failed
+	// against every real scan. This asserts the shared loader reads the object.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "findings.json")
+
+	fs := findings.NewFindingSet()
+	fs.Add(findings.NewFinding("SEC-001", findings.SeverityHigh, findings.ConfidenceHigh,
+		findings.Location{FilePath: "config.env", StartLine: 1, EndLine: 1}, "secret"))
+	data, err := NewJSONReporter("test").Generate(fs)
+	if err != nil {
+		t.Fatalf("building report: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("writing: %v", err)
+	}
+
+	got, err := LoadFindingsFile(path)
+	if err != nil {
+		t.Fatalf("LoadFindingsFile on a real scan artifact failed: %v", err)
+	}
+	if len(got) != 1 || got[0].RuleID != "SEC-001" {
+		t.Fatalf("loaded %d findings, want 1 SEC-001: %+v", len(got), got)
+	}
+
+	// And the report projects active findings.
+	full, err := LoadFindingsFileReport(path)
+	if err != nil {
+		t.Fatalf("LoadFindingsFileReport: %v", err)
+	}
+	if len(full.ActiveFindings()) != 1 {
+		t.Fatalf("ActiveFindings = %d, want 1", len(full.ActiveFindings()))
 	}
 }

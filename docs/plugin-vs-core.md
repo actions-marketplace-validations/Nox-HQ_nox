@@ -2,7 +2,7 @@
 
 This document codifies the architectural rule that decides whether a
 detection capability ships in `core/` or as a separate plugin in
-`plugins/nox-plugin-*`.
+their own repositories under the `Nox-HQ` org (`nox-plugin-*`), each released independently.
 
 The boundary exists because nox is positioned as a **deterministic,
 offline-first, read-only** security primitive (per `CLAUDE.md`). Core
@@ -45,7 +45,7 @@ Anything that fails any of these is a **plugin**.
 
 | Plugin | Track | Why plugin |
 |---|---|---|
-| reachability | core-analysis | Language-specific parsers (Go AST, Rust crate, Java import) inflate binary; bundled by default |
+| reachability | core-analysis | Language-specific parsers (Go AST, Rust crate, Java import) inflate binary, and golang.org/x/vuln pulls the Go analysis toolchain into core |
 | taint-analysis | core-analysis | Heavyweight AST + interprocedural call graphs |
 | arch-lint | core-analysis | Org-specific dependency rules |
 | sast | core-analysis | Language-specific code-injection patterns (SQLi, XSS, path traversal) |

@@ -1,10 +1,13 @@
 package core
 
 import (
+	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -136,6 +139,80 @@ const apiKey = "` + awsKey + `"
 	}
 }
 
+func TestRunScan_SASTOffSkipsLanguage(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+
+	// Turn Go off; Python stays at its default (deep). Both files carry the same
+	// detectable secret, so only the Python finding must survive.
+	configContent := `scan:
+  sast:
+    languages:
+      go: off
+`
+	if err := os.WriteFile(filepath.Join(tmpDir, ".nox.yaml"), []byte(configContent), 0o644); err != nil {
+		t.Fatalf("failed to write config: %v", err)
+	}
+	awsKey := "AKIAIOSFODNN7EXAMPLE"
+	goFile := "package main\n\nconst apiKey = \"" + awsKey + "\"\n"
+	if err := os.WriteFile(filepath.Join(tmpDir, "main.go"), []byte(goFile), 0o644); err != nil {
+		t.Fatalf("failed to write go file: %v", err)
+	}
+	pyFile := "api_key = \"" + awsKey + "\"\n"
+	if err := os.WriteFile(filepath.Join(tmpDir, "app.py"), []byte(pyFile), 0o644); err != nil {
+		t.Fatalf("failed to write py file: %v", err)
+	}
+
+	result, err := RunScan(tmpDir)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	var goFindings, pyFindings int
+	for _, f := range result.Findings.Findings() {
+		switch f.Location.FilePath {
+		case "main.go":
+			goFindings++
+		case "app.py":
+			pyFindings++
+		}
+	}
+	if goFindings != 0 {
+		t.Errorf("go=off must yield zero findings on main.go, got %d", goFindings)
+	}
+	if pyFindings == 0 {
+		t.Error("python (default deep) must still produce findings on app.py, got none")
+	}
+
+	// The resolved profile is recorded for audit.
+	if result.SASTProfile["go"] != "off" {
+		t.Errorf("result.SASTProfile[go] = %q, want off", result.SASTProfile["go"])
+	}
+	if result.SASTProfile["python"] != "deep" {
+		t.Errorf("result.SASTProfile[python] = %q, want deep", result.SASTProfile["python"])
+	}
+}
+
+func TestRunScan_SASTInvalidDepthFailsScan(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	configContent := `scan:
+  sast:
+    languages:
+      go: shallow
+`
+	if err := os.WriteFile(filepath.Join(tmpDir, ".nox.yaml"), []byte(configContent), 0o644); err != nil {
+		t.Fatalf("failed to write config: %v", err)
+	}
+
+	_, err := RunScan(tmpDir)
+	if err == nil {
+		t.Fatal("expected error for invalid SAST depth, got nil")
+	}
+}
+
 func TestRunScan_NonExistentDirectory(t *testing.T) {
 	t.Parallel()
 
@@ -222,6 +299,120 @@ func TestRunScan_ConfigDisableRule(t *testing.T) {
 		if f.RuleID == "SEC-001" {
 			t.Error("expected SEC-001 to be disabled, but found a finding")
 		}
+	}
+}
+
+// The generated-paths filter drops content-rule findings (AI-*, MCP-*) on
+// generated/vendored files but leaves them in human-authored source — and
+// never touches dependency findings, so a lockfile is still CVE-scanned.
+func TestGeneratedPathsFilter_ScopedToContentRules(t *testing.T) {
+	t.Parallel()
+
+	fs := findings.NewFindingSet()
+	fs.Add(findings.Finding{RuleID: "AI-026", Location: findings.Location{FilePath: "pnpm-lock.yaml", StartLine: 1}, Message: "logger noise"})
+	fs.Add(findings.Finding{RuleID: "AI-026", Location: findings.Location{FilePath: "src/app.ts", StartLine: 1}, Message: "real"})
+	fs.Add(findings.Finding{RuleID: "MCP-022", Location: findings.Location{FilePath: "worker-configuration.d.ts", StartLine: 1}, Message: "gen types"})
+	fs.Add(findings.Finding{RuleID: "VULN-001", Location: findings.Location{FilePath: "package-lock.json", StartLine: 1}, Message: "real CVE"})
+
+	fs.RemoveByRuleIDsAndPaths([]string{"AI-*", "MCP-*"}, DefaultGeneratedPaths())
+
+	got := map[string]bool{}
+	for _, f := range fs.Findings() {
+		got[f.RuleID+"@"+f.Location.FilePath] = true
+	}
+	if got["AI-026@pnpm-lock.yaml"] {
+		t.Error("AI finding on a lockfile should be filtered")
+	}
+	if got["MCP-022@worker-configuration.d.ts"] {
+		t.Error("MCP finding on generated type defs should be filtered")
+	}
+	if !got["AI-026@src/app.ts"] {
+		t.Error("AI finding in real source must be kept")
+	}
+	if !got["VULN-001@package-lock.json"] {
+		t.Error("dependency finding on a lockfile must be kept (CVE scanning intact)")
+	}
+}
+
+// Offline scan over a project containing a lockfile must complete without
+// reaching the network. The authoritative no-egress assertion lives in the
+// deps package (TestOSVDisabled_NoNetworkEgress); this is the integration
+// smoke that the Offline option threads through RunScan.
+func TestRunScanWithOptions_OfflineSucceeds(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmpDir, "package-lock.json"),
+		[]byte(`{"packages":{"node_modules/express":{"version":"4.18.2"}}}`), 0o644); err != nil {
+		t.Fatalf("write lockfile: %v", err)
+	}
+
+	result, err := RunScanWithOptions(tmpDir, ScanOptions{Offline: true})
+	if err != nil {
+		t.Fatalf("offline scan failed: %v", err)
+	}
+	if result == nil {
+		t.Fatal("expected a scan result")
+	}
+}
+
+// Regression: skip_analyzer was documented and parsed but never applied.
+func TestRunScan_ConfigSkipAnalyzer(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+
+	// skip the entire secrets analyzer for files under generated/.
+	noxConfig := filepath.Join(tmpDir, ".nox.yaml")
+	configContent := `scan:
+  analyzer_rules:
+    - analyzer: secrets
+      action: skip_analyzer
+      paths:
+        - "generated/*"
+`
+	if err := os.WriteFile(noxConfig, []byte(configContent), 0o644); err != nil {
+		t.Fatalf("write .nox.yaml: %v", err)
+	}
+
+	genDir := filepath.Join(tmpDir, "generated")
+	if err := os.MkdirAll(genDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// A secret under generated/ (skipped) and one under src/ (kept).
+	if err := os.WriteFile(filepath.Join(genDir, "g.go"), []byte(`const key = "AKIAIOSFODNN7EXAMPLE"`), 0o644); err != nil {
+		t.Fatalf("write generated file: %v", err)
+	}
+	srcDir := filepath.Join(tmpDir, "src")
+	if err := os.MkdirAll(srcDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(srcDir, "s.go"), []byte(`const key = "AKIAIOSFODNN7EXAMPLE"`), 0o644); err != nil {
+		t.Fatalf("write src file: %v", err)
+	}
+
+	result, err := RunScan(tmpDir)
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+
+	var genSecrets, srcSecrets int
+	for _, f := range result.Findings.Findings() {
+		if !strings.HasPrefix(f.RuleID, "SEC-") {
+			continue
+		}
+		if strings.Contains(f.Location.FilePath, "generated/") {
+			genSecrets++
+		}
+		if strings.Contains(f.Location.FilePath, "src/") {
+			srcSecrets++
+		}
+	}
+	if genSecrets != 0 {
+		t.Errorf("skip_analyzer should remove SEC findings under generated/, got %d", genSecrets)
+	}
+	if srcSecrets == 0 {
+		t.Error("secrets analyzer must still run for non-skipped paths (src/)")
 	}
 }
 
@@ -1745,6 +1936,85 @@ const apiKey = "AKIAIOSFODNN7EXAMPLE"
 
 // initGitRepo creates a git repo with an initial commit containing the given
 // files. Each key in files is a relative path and each value is the content.
+// TestRunScanWithOptions_TrackedOnly verifies that --tracked-only scans only
+// git-tracked files: an untracked working-tree file (scratch, build output, an
+// un-added draft) is excluded, while committed files are still scanned. This
+// makes a CI gate reproducible — it sees exactly what a reviewer sees.
+func TestRunScanWithOptions_TrackedOnly(t *testing.T) {
+	t.Parallel()
+
+	const secret = "package main\nconst key = \"AKIAIOSFODNN7EXAMPLE\"\n"
+	dir := initGitRepo(t, map[string]string{"tracked.go": secret})
+
+	// An untracked working-tree file with its own secret.
+	if err := os.WriteFile(filepath.Join(dir, "untracked.go"), []byte(secret), 0o644); err != nil {
+		t.Fatalf("writing untracked file: %v", err)
+	}
+
+	scanned := func(res *ScanResult, name string) bool {
+		for _, f := range res.Findings.Findings() {
+			if strings.HasSuffix(f.Location.FilePath, name) {
+				return true
+			}
+		}
+		return false
+	}
+
+	// A default scan sees both the tracked and the untracked file.
+	full, err := RunScanWithOptions(dir, ScanOptions{})
+	if err != nil {
+		t.Fatalf("full scan: %v", err)
+	}
+	if !scanned(full, "untracked.go") {
+		t.Fatal("default scan should include the untracked file (sanity check)")
+	}
+
+	// --tracked-only drops the untracked file but keeps the tracked one.
+	tracked, err := RunScanWithOptions(dir, ScanOptions{TrackedOnly: true})
+	if err != nil {
+		t.Fatalf("tracked-only scan: %v", err)
+	}
+	if scanned(tracked, "untracked.go") {
+		t.Error("tracked-only scan must exclude the untracked working-tree file")
+	}
+	if !scanned(tracked, "tracked.go") {
+		t.Error("tracked-only scan must still include the tracked file")
+	}
+}
+
+// TestRunScan_SingleFileTarget verifies `nox scan path/to/file` scans just that
+// file — loading config from the file's directory (not `file/.nox.yaml`) and
+// producing findings for the file. This is the basis for fast pre-commit hooks
+// and editor integrations. Previously a file target failed on config loading
+// and the walker skipped its own root, yielding nothing.
+func TestRunScan_SingleFileTarget(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	file := filepath.Join(dir, "app.py")
+	if err := os.WriteFile(file, []byte("import os\neval(response)\nkey = \"AKIAIOSFODNN7EXAMPLE\"\n"), 0o644); err != nil {
+		t.Fatalf("writing file: %v", err)
+	}
+	// A sibling file that must NOT be scanned when a single file is targeted.
+	if err := os.WriteFile(filepath.Join(dir, "other.py"), []byte("key = \"AKIAIOSFODNN7EXAMPLE\"\n"), 0o644); err != nil {
+		t.Fatalf("writing sibling: %v", err)
+	}
+
+	result, err := RunScan(file)
+	if err != nil {
+		t.Fatalf("RunScan(file): %v", err)
+	}
+	ff := result.Findings.Findings()
+	if len(ff) == 0 {
+		t.Fatal("expected findings for the single file")
+	}
+	for _, f := range ff {
+		if strings.Contains(f.Location.FilePath, "other.py") {
+			t.Errorf("single-file scan must not include the sibling other.py: %s", f.Location.FilePath)
+		}
+	}
+}
+
 func initGitRepo(t *testing.T, files map[string]string) string {
 	t.Helper()
 
@@ -1753,6 +2023,13 @@ func initGitRepo(t *testing.T, files map[string]string) string {
 	// git init
 	cmd := exec.Command("git", "init")
 	cmd.Dir = dir
+	cmd.Env = append(os.Environ(),
+		// Git may fork `gc --auto` on commit, which keeps writing into
+		// .git/objects after the command returns; t.TempDir cleanup then
+		// races it and RemoveAll fails with "directory not empty".
+		"GIT_CONFIG_COUNT=2",
+		"GIT_CONFIG_KEY_0=gc.auto", "GIT_CONFIG_VALUE_0=0",
+		"GIT_CONFIG_KEY_1=maintenance.auto", "GIT_CONFIG_VALUE_1=false")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git init: %v\n%s", err, out)
 	}
@@ -1879,6 +2156,13 @@ func TestRunHistoryScan_EmptyRepo(t *testing.T) {
 	// Init an empty repo with no commits.
 	cmd := exec.Command("git", "init")
 	cmd.Dir = dir
+	cmd.Env = append(os.Environ(),
+		// Git may fork `gc --auto` on commit, which keeps writing into
+		// .git/objects after the command returns; t.TempDir cleanup then
+		// races it and RemoveAll fails with "directory not empty".
+		"GIT_CONFIG_COUNT=2",
+		"GIT_CONFIG_KEY_0=gc.auto", "GIT_CONFIG_VALUE_0=0",
+		"GIT_CONFIG_KEY_1=maintenance.auto", "GIT_CONFIG_VALUE_1=false")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git init: %v\n%s", err, out)
 	}
@@ -2014,5 +2298,214 @@ func TestRunHistoryScan_ResultHasRules(t *testing.T) {
 	}
 	if result.AIInventory == nil {
 		t.Fatal("expected non-nil AI inventory")
+	}
+}
+
+func TestRunScanContext_CanceledContext(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel before running
+	_, err := RunScanContext(ctx, t.TempDir(), ScanOptions{})
+	if err == nil {
+		t.Fatal("expected error from a canceled context")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("expected context.Canceled, got %v", err)
+	}
+}
+
+func TestConfidenceMeetsThreshold(t *testing.T) {
+	cases := []struct {
+		conf, thresh findings.Confidence
+		want         bool
+	}{
+		{findings.ConfidenceHigh, findings.ConfidenceHigh, true},
+		{findings.ConfidenceMedium, findings.ConfidenceHigh, false},
+		{findings.ConfidenceLow, findings.ConfidenceHigh, false},
+		{findings.ConfidenceMedium, findings.ConfidenceMedium, true},
+		{findings.ConfidenceLow, findings.ConfidenceMedium, false},
+		{findings.ConfidenceLow, findings.ConfidenceLow, true},
+		{findings.ConfidenceHigh, findings.ConfidenceLow, true},
+		{findings.ConfidenceMedium, "", true}, // empty threshold = pass-through
+	}
+	for _, c := range cases {
+		if got := ConfidenceMeetsThreshold(c.conf, c.thresh); got != c.want {
+			t.Errorf("ConfidenceMeetsThreshold(%q,%q)=%v want %v", c.conf, c.thresh, got, c.want)
+		}
+	}
+}
+
+// TestRunScan_PostScanPluginHook verifies the post-scan hook (which runs
+// context-requiring plugins like reachability that need the scan's findings)
+// fires when plugins are required, and that a finding it adds flows through the
+// rest of the pipeline into the result.
+func TestRunScan_PostScanPluginHook(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, ".nox.yaml"),
+		[]byte("plugins:\n  required:\n    - nox/reachability\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "app.py"), []byte("x = 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	called := false
+	var gotRequired []string
+	PostScanPluginHook = func(_ context.Context, result *ScanResult, _ string, required []string) error {
+		called = true
+		gotRequired = required
+		result.Findings.Add(findings.Finding{
+			RuleID: "REACH-001", Severity: findings.SeverityInfo, Confidence: findings.ConfidenceHigh,
+			Message: "unreachable (test)", Location: findings.Location{FilePath: "app.py", StartLine: 1},
+			Metadata: map[string]string{"reachable": "false"},
+		})
+		return nil
+	}
+	defer func() { PostScanPluginHook = nil }()
+
+	res, err := RunScan(dir)
+	if err != nil {
+		t.Fatalf("RunScan: %v", err)
+	}
+	if !called {
+		t.Fatal("post-scan hook was not called despite plugins.required being set")
+	}
+	if len(gotRequired) != 1 || gotRequired[0] != "nox/reachability" {
+		t.Errorf("hook got required=%v, want [nox/reachability]", gotRequired)
+	}
+	found := false
+	for _, f := range res.Findings.Findings() {
+		if f.RuleID == "REACH-001" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("finding added by the post-scan hook did not reach the result")
+	}
+}
+
+// refineContextDowngradeFixture builds a finding set exercising every branch of
+// the context-gated downgrade: an in-scope code-pattern family in a
+// non-production tree (downgrades), the same family in real source (kept), an
+// out-of-scope SEC-* in tests (kept), and a VULN-* dependency fact in vendor
+// (kept).
+//
+// Paths avoid the default noise-dir names (test/, examples/, ...) because the
+// pre-existing GeneratedPaths noise filter already *removes* AI-*/MCP-* findings
+// there. We use docs/ and dist/ — non-production for the downgrade but not on
+// the noise-dir list — so the downgrade is what we observe, not the removal.
+func refineContextDowngradeFixture() *findings.FindingSet {
+	fs := findings.NewFindingSet()
+	// In-scope code-pattern family, non-production path -> downgrades.
+	fs.Add(findings.Finding{RuleID: "IAC-010", Severity: findings.SeverityHigh, Confidence: findings.ConfidenceHigh, Location: findings.Location{FilePath: "docs/main.tf", StartLine: 1}, Message: "iac misconfig in docs"})
+	// Same family + severity, real source -> kept.
+	fs.Add(findings.Finding{RuleID: "IAC-010", Severity: findings.SeverityHigh, Confidence: findings.ConfidenceHigh, Location: findings.Location{FilePath: "src/main.tf", StartLine: 1}, Message: "iac misconfig in source"})
+	// Out-of-scope family in a non-production tree -> kept (test secrets are real).
+	// SEC-* survives the noise-dir filter (that filter only drops AI-*/MCP-*), so
+	// tests/ is a valid place to assert SEC is neither removed nor downgraded.
+	fs.Add(findings.Finding{RuleID: "SEC-001", Severity: findings.SeverityCritical, Confidence: findings.ConfidenceHigh, Location: findings.Location{FilePath: "tests/creds_test.py", StartLine: 1}, Message: "hardcoded key in test"})
+	// Dependency fact in vendor/ -> kept (risk is a property of the package).
+	fs.Add(findings.Finding{RuleID: "VULN-001", Severity: findings.SeverityHigh, Confidence: findings.ConfidenceHigh, Location: findings.Location{FilePath: "vendor/x/pkg.json", StartLine: 1}, Message: "vulnerable dep"})
+	return fs
+}
+
+func findBy(fs *findings.FindingSet, ruleID, path string) *findings.Finding {
+	for i := range fs.Findings() {
+		f := fs.Findings()[i]
+		if f.RuleID == ruleID && f.Location.FilePath == path {
+			return &f
+		}
+	}
+	return nil
+}
+
+func TestRefineFindings_ContextDowngrade_Default(t *testing.T) {
+	t.Parallel()
+
+	fs := refineContextDowngradeFixture()
+	if err := refineFindings(fs, &ScanConfig{}, ScanOptions{}, t.TempDir(), nil, nil, nil); err != nil {
+		t.Fatalf("refineFindings: %v", err)
+	}
+
+	// IAC-010 in docs/ downgrades high->medium and records provenance.
+	ex := findBy(fs, "IAC-010", "docs/main.tf")
+	if ex == nil {
+		t.Fatal("IAC-010 in docs/ missing")
+	}
+	if ex.Severity != findings.SeverityMedium {
+		t.Errorf("docs IAC-010 severity = %q, want medium", ex.Severity)
+	}
+	if ex.Metadata["original_severity"] != "high" {
+		t.Errorf("docs IAC-010 original_severity = %q, want high", ex.Metadata["original_severity"])
+	}
+	if ex.Metadata["context"] != "non-production" {
+		t.Errorf("docs IAC-010 context = %q, want non-production", ex.Metadata["context"])
+	}
+
+	// IAC-010 in src/ is untouched — real shipping source.
+	src := findBy(fs, "IAC-010", "src/main.tf")
+	if src == nil || src.Severity != findings.SeverityHigh {
+		t.Errorf("src IAC-010 must stay high, got %+v", src)
+	}
+	if src != nil && src.Metadata["original_severity"] != "" {
+		t.Error("src IAC-010 must not carry original_severity")
+	}
+
+	// SEC-001 in tests/ is out of scope — a leaked key in a test is often real.
+	sec := findBy(fs, "SEC-001", "tests/creds_test.py")
+	if sec == nil || sec.Severity != findings.SeverityCritical {
+		t.Errorf("SEC-001 in tests must stay critical, got %+v", sec)
+	}
+
+	// VULN-001 in vendor/ is a dependency fact — not downgraded.
+	vuln := findBy(fs, "VULN-001", "vendor/x/pkg.json")
+	if vuln == nil || vuln.Severity != findings.SeverityHigh {
+		t.Errorf("VULN-001 in vendor must stay high, got %+v", vuln)
+	}
+}
+
+func TestRefineFindings_ContextDowngrade_Disabled(t *testing.T) {
+	t.Parallel()
+
+	fs := refineContextDowngradeFixture()
+	off := false
+	cfg := &ScanConfig{}
+	cfg.Scan.ContextDowngrade = &off
+	if err := refineFindings(fs, cfg, ScanOptions{}, t.TempDir(), nil, nil, nil); err != nil {
+		t.Fatalf("refineFindings: %v", err)
+	}
+
+	ex := findBy(fs, "IAC-010", "docs/main.tf")
+	if ex == nil || ex.Severity != findings.SeverityHigh {
+		t.Errorf("with context_downgrade:false, docs IAC-010 must stay high, got %+v", ex)
+	}
+	if ex != nil && ex.Metadata["original_severity"] != "" {
+		t.Error("disabled downgrade must not stamp original_severity")
+	}
+}
+
+// TestScan_TrackedOnlyOutsideRepoIsError guards a silent scope inversion.
+//
+// --tracked-only seeds the walker's allow-list from `git ls-files`. On a git
+// failure the previous code skipped that block, leaving the allow-list empty —
+// which the walker reads as "no restriction", so --tracked-only silently
+// scanned the ENTIRE working tree including the untracked and generated files
+// the flag exists to exclude. An operator got the opposite of what they asked
+// for. It is now a hard error, matching --vex / --terraform-plan.
+func TestScan_TrackedOnlyOutsideRepoIsError(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir() // a temp dir is not a git repository
+	if err := os.WriteFile(filepath.Join(dir, "untracked.py"),
+		[]byte("x = 1\n"), 0o644); err != nil {
+		t.Fatalf("writing file: %v", err)
+	}
+
+	_, err := RunScanWithOptions(dir, ScanOptions{TrackedOnly: true, Offline: true})
+	if err == nil {
+		t.Fatal("expected an error for --tracked-only outside a git repository, got nil")
+	}
+	if !strings.Contains(err.Error(), "tracked-only") {
+		t.Errorf("expected the error to name --tracked-only, got: %v", err)
 	}
 }

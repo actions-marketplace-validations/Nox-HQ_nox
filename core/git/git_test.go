@@ -174,6 +174,82 @@ func TestStagedContent_SubDir(t *testing.T) {
 	}
 }
 
+func TestTrackedFiles(t *testing.T) {
+	dir := setupGitRepo(t) // starts with a tracked README.md
+
+	// A directory ignored by .gitignore, but with a file force-added (tracked).
+	writeFile(t, filepath.Join(dir, ".gitignore"), "mobile/\n")
+	if err := os.MkdirAll(filepath.Join(dir, "mobile"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(dir, "mobile", "app.go"), "package m")
+	writeFile(t, filepath.Join(dir, "mobile", "ignored.go"), "package m")
+	run(t, dir, "git", "add", ".gitignore", "README.md")
+	run(t, dir, "git", "add", "-f", "mobile/app.go") // force-track despite ignore
+	run(t, dir, "git", "commit", "-m", "add tracked file under ignored dir")
+
+	tracked, err := TrackedFiles(dir)
+	if err != nil {
+		t.Fatalf("TrackedFiles: %v", err)
+	}
+	got := map[string]bool{}
+	for _, f := range tracked {
+		got[f] = true
+	}
+	// The force-added file is tracked even though mobile/ is gitignored —
+	// this is exactly what git ls-files reports, and why the scanner must
+	// cover it (#142).
+	if !got["mobile/app.go"] {
+		t.Errorf("expected tracked mobile/app.go, got %v", tracked)
+	}
+	if !got[".gitignore"] || !got["README.md"] {
+		t.Errorf("expected .gitignore and README.md tracked, got %v", tracked)
+	}
+	if got["mobile/ignored.go"] {
+		t.Error("mobile/ignored.go was never added — it must not be tracked")
+	}
+}
+
+// TestTrackedFiles_Submodules verifies tracked-only scans reach into an
+// initialized submodule (roadmap 1.2). Without --recurse-submodules, git
+// ls-files reports the submodule only as a gitlink, so its scannable content
+// would be invisible to a tracked-only scan even though a normal walk sees it.
+func TestTrackedFiles_Submodules(t *testing.T) {
+	// A separate repo that will become the submodule.
+	subRemote := t.TempDir()
+	run(t, subRemote, "git", "init", "-b", "main")
+	run(t, subRemote, "git", "config", "user.email", "test@test.com")
+	run(t, subRemote, "git", "config", "user.name", "Test")
+	writeFile(t, filepath.Join(subRemote, "lib.go"), "package lib")
+	run(t, subRemote, "git", "add", ".")
+	run(t, subRemote, "git", "commit", "-m", "sub initial")
+
+	super := setupGitRepo(t)
+	// Local submodule add needs protocol.file.allow=always on modern git.
+	run(t, super, "git", "-c", "protocol.file.allow=always", "submodule", "add", subRemote, "vendor/sub")
+	run(t, super, "git", "commit", "-m", "add submodule")
+
+	tracked, err := TrackedFiles(super)
+	if err != nil {
+		t.Fatalf("TrackedFiles: %v", err)
+	}
+	got := map[string]bool{}
+	for _, f := range tracked {
+		got[f] = true
+	}
+	if !got["vendor/sub/lib.go"] {
+		t.Errorf("expected submodule file vendor/sub/lib.go in tracked set, got %v", tracked)
+	}
+}
+
+func TestTrackedFiles_InvalidRepo(t *testing.T) {
+	dir := t.TempDir()
+	_, err := TrackedFiles(dir)
+	if err == nil {
+		t.Fatal("expected error for non-git directory, got nil")
+	}
+}
+
 // setupGitRepo creates a temp dir with a git repo and an initial commit.
 func setupGitRepo(t *testing.T) string {
 	t.Helper()
@@ -192,7 +268,14 @@ func run(t *testing.T, dir, name string, args ...string) {
 	t.Helper()
 	cmd := exec.Command(name, args...)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "HOME="+dir)
+	cmd.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "HOME="+dir,
+		// Git may fork `gc --auto` on commit, which keeps writing into
+		// .git/objects after the command returns. t.TempDir cleanup then races
+		// it and RemoveAll fails with "directory not empty", failing a test
+		// that had already passed. Disabling auto-maintenance removes the race.
+		"GIT_CONFIG_COUNT=2",
+		"GIT_CONFIG_KEY_0=gc.auto", "GIT_CONFIG_VALUE_0=0",
+		"GIT_CONFIG_KEY_1=maintenance.auto", "GIT_CONFIG_VALUE_1=false")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("%s %v: %v\n%s", name, args, err, out)

@@ -1,211 +1,122 @@
 package deps
 
 import (
-	"bytes"
-	"context"
-	"encoding/json"
 	"fmt"
-	"net/http"
 	"strconv"
 	"strings"
 
+	"github.com/nox-hq/nox-core/vulnsource"
+	"github.com/nox-hq/nox-core/vulnsource/osv"
 	"github.com/nox-hq/nox/core/findings"
 )
 
-// osvBatchLimit is the maximum number of queries per OSV batch request.
-const osvBatchLimit = 1000
-
-// osvQuery is a single package query for the OSV batch API.
-type osvQuery struct {
-	Package osvPackage `json:"package"`
-	Version string     `json:"version"`
-}
-
-// osvPackage identifies a package by name and ecosystem.
-type osvPackage struct {
-	Name      string `json:"name"`
-	Ecosystem string `json:"ecosystem"`
-}
-
-// osvBatchRequest is the request body for POST /v1/querybatch.
-type osvBatchRequest struct {
-	Queries []osvQuery `json:"queries"`
-}
-
-// osvBatchResponse is the response from the OSV batch endpoint.
-type osvBatchResponse struct {
-	Results []osvBatchResult `json:"results"`
-}
-
-// osvBatchResult holds vulnerabilities for a single query.
-type osvBatchResult struct {
-	Vulns []osvVuln `json:"vulns"`
-}
-
-// osvVuln is a single vulnerability from OSV.
-type osvVuln struct {
-	ID       string        `json:"id"`
-	Summary  string        `json:"summary"`
-	Severity []osvSeverity `json:"severity"`
-	Aliases  []string      `json:"aliases"`
-	Details  string        `json:"details"`
-	Affected []osvAffected `json:"affected"`
-}
-
-// osvSeverity holds a CVSS or other severity score.
-type osvSeverity struct {
-	Type  string `json:"type"`
-	Score string `json:"score"`
-}
-
-// osvAffected describes packages and version ranges affected by a vuln.
-// We only consume Package and Ranges — the broader OSV schema includes
-// many additional fields not yet used here.
-type osvAffected struct {
-	Package osvPackage `json:"package"`
-	Ranges  []osvRange `json:"ranges"`
-}
-
-// osvRange is a version range with events marking introduction / fix.
-type osvRange struct {
-	Type   string     `json:"type"`
-	Events []osvEvent `json:"events"`
-}
-
-// osvEvent is a single point in a version range. Either Introduced or
-// Fixed (or LastAffected) is populated; the others are empty.
-type osvEvent struct {
-	Introduced   string `json:"introduced,omitempty"`
-	Fixed        string `json:"fixed,omitempty"`
-	LastAffected string `json:"last_affected,omitempty"`
-	Limit        string `json:"limit,omitempty"`
-}
-
-// fixedVersion returns the lowest fixed version listed across the affected
-// entries that match the given package name + ecosystem. Returns "" when
-// the OSV record names no fix (an unfixed vulnerability).
-func fixedVersion(vuln *osvVuln, pkgName, ecosystem string) string {
-	want := strings.ToLower(pkgName)
-	wantEco := ecosystemToOSV(ecosystem)
-	var first string
-	for _, aff := range vuln.Affected {
-		if !strings.EqualFold(aff.Package.Name, want) {
-			continue
-		}
-		if aff.Package.Ecosystem != "" && aff.Package.Ecosystem != wantEco {
-			continue
-		}
-		for _, r := range aff.Ranges {
-			for _, e := range r.Events {
-				if e.Fixed != "" && first == "" {
-					first = e.Fixed
-				}
-			}
-		}
-	}
-	return first
-}
-
-// queryOSV queries the OSV.dev batch API for known vulnerabilities affecting
-// the given packages. It batches requests in groups of osvBatchLimit and
-// returns a map from package index to the vulnerabilities found.
+// The OSV wire protocol — batching, ecosystem filtering, the query-then-hydrate
+// two-step, and its failure modes — lives in core/vulnsource/osv behind the
+// vulnsource.Source interface. What stays here is the semantic layer applied to
+// whatever a source returns: which version clears an advisory, what severity a
+// score maps to, and how an operator upgrades.
 //
-// On network errors the function returns an empty map (graceful degradation)
-// rather than failing the scan, honouring Nox's offline-first design.
-func queryOSV(ctx context.Context, client *http.Client, baseURL string, pkgs []Package) (map[int][]osvVuln, error) {
-	result := make(map[int][]osvVuln)
+// The record types are aliases rather than conversions. vulnsource.Record is
+// OSV-wire-shaped by design (see the vulnsource package docs), so a conversion
+// layer here would be a no-op that could only introduce drift.
+type (
+	osvVuln              = vulnsource.Record
+	osvSeverity          = vulnsource.Severity
+	osvPackage           = vulnsource.Package
+	osvAffected          = vulnsource.Affected
+	osvRange             = vulnsource.Range
+	osvEvent             = vulnsource.Event
+	osvImport            = vulnsource.Import
+	osvEcosystemSpecific = vulnsource.EcosystemSpecific
+	osvDatabaseSpecific  = vulnsource.DatabaseSpecific
 
-	for start := 0; start < len(pkgs); start += osvBatchLimit {
-		end := start + osvBatchLimit
-		if end > len(pkgs) {
-			end = len(pkgs)
-		}
-		batch := pkgs[start:end]
+	osvBatchRequest  = osv.BatchRequest
+	osvBatchResponse = osv.BatchResponse
+	osvBatchResult   = osv.BatchResult
+)
 
-		queries := make([]osvQuery, len(batch))
-		for i, p := range batch {
-			queries[i] = osvQuery{
-				Package: osvPackage{
-					Name:      p.Name,
-					Ecosystem: ecosystemToOSV(p.Ecosystem),
-				},
-				Version: p.Version,
-			}
-		}
+// The interval arithmetic lives in core/vulnsource, imported by both this
+// analyzer and any source holding a local corpus, so the two cannot come to
+// disagree about which versions an advisory affects. What remains here is the
+// nox-ecosystem-to-OSV-vocabulary mapping, which is a wire concern.
 
-		body, err := json.Marshal(osvBatchRequest{Queries: queries})
-		if err != nil {
-			return nil, fmt.Errorf("marshalling OSV request: %w", err)
-		}
-
-		url := strings.TrimRight(baseURL, "/") + "/v1/querybatch"
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-		if err != nil {
-			return nil, fmt.Errorf("creating OSV request: %w", err)
-		}
-		req.Header.Set("Content-Type", "application/json")
-
-		resp, err := client.Do(req)
-		if err != nil {
-			// Network error — degrade gracefully.
-			return result, nil
-		}
-
-		vulns, decodeErr := decodeBatchResponse(resp)
-		_ = resp.Body.Close()
-		if decodeErr != nil {
-			return result, nil
-		}
-
-		for i, br := range vulns {
-			if len(br.Vulns) > 0 {
-				result[start+i] = br.Vulns
-			}
-		}
-	}
-
-	return result, nil
-}
-
-// decodeBatchResponse reads and decodes an OSV batch response. It returns
-// an error for non-200 status codes or decode failures.
-func decodeBatchResponse(resp *http.Response) ([]osvBatchResult, error) {
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("OSV API returned status %d", resp.StatusCode)
-	}
-	var batchResp osvBatchResponse
-	if err := json.NewDecoder(resp.Body).Decode(&batchResp); err != nil {
-		return nil, err
-	}
-	return batchResp.Results, nil
+func fixedVersion(vuln *osvVuln, pkgName, ecosystem, installed string) string {
+	return vuln.FixedVersion(pkgName, ecosystemToOSV(ecosystem), installed)
 }
 
 // mapOSVSeverity converts OSV severity entries to a nox Severity.
-// It looks for a CVSS_V3 score first, then falls back to CVSS_V2.
-// If no score is found, it returns SeverityMedium as a conservative default.
-func mapOSVSeverity(sev []osvSeverity) findings.Severity {
+// It looks for a CVSS_V3 score first, then falls back to CVSS_V2, then to the
+// source database's coarse severity label.
+//
+// The label matters because CVSS v4 vectors score by a different and
+// substantially more complex algorithm that cvssToSeverity does not attempt.
+// Without the fallback, an advisory publishing only a v4 vector — an
+// increasingly common case — silently collapsed to medium regardless of how
+// severe it actually was. SeverityMedium now means a genuine "unknown".
+func mapOSVSeverity(sev []osvSeverity, dbSpecific osvDatabaseSpecific) findings.Severity {
+	// A computable CVSS base score is the most precise signal, so it wins when
+	// one is available. Note the score must be PARSED, not merely present: a
+	// CVSS v2 vector matches the type check but cannot be scored, and returning
+	// on it discarded an accurate database label in favour of cvssToSeverity's
+	// medium default.
 	for _, s := range sev {
-		if s.Type == "CVSS_V3" || s.Type == "CVSS_V2" {
-			return cvssToSeverity(s.Score)
+		if s.Type != "CVSS_V3" && s.Type != "CVSS_V2" {
+			continue
+		}
+		if score, ok := cvssBaseScore(s.Score); ok {
+			return scoreToSeverity(score)
 		}
 	}
+
+	// No score we could compute — fall back to the source database's coarse
+	// label. This is the only severity signal for CVSS v4-only advisories.
+	if s, ok := severityFromLabel(dbSpecific.Severity); ok {
+		return s
+	}
+
+	// Genuinely unknown.
 	return findings.SeverityMedium
 }
 
-// cvssToSeverity converts a CVSS vector string or numeric score to a Severity.
-// It extracts the base score from either a bare number ("9.8") or a CVSS
-// vector string by looking for a trailing numeric value.
-func cvssToSeverity(score string) findings.Severity {
-	// Try parsing as a plain float first (e.g. "9.8").
-	f, err := strconv.ParseFloat(score, 64)
-	if err != nil {
-		// Try extracting the base score from a CVSS vector string.
-		// CVSS vectors look like "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
-		// — the score is not embedded in the vector, so we can't parse it.
-		// Fall back to medium.
-		return findings.SeverityMedium
+// severityFromLabel maps a coarse textual severity label to a nox Severity.
+// GitHub advisories say "MODERATE" where most other sources say "MEDIUM".
+func severityFromLabel(label string) (findings.Severity, bool) {
+	switch strings.ToUpper(strings.TrimSpace(label)) {
+	case "CRITICAL":
+		return findings.SeverityCritical, true
+	case "HIGH":
+		return findings.SeverityHigh, true
+	case "MODERATE", "MEDIUM":
+		return findings.SeverityMedium, true
+	case "LOW":
+		return findings.SeverityLow, true
+	default:
+		return "", false
+	}
+}
+
+// cvssBaseScore returns the CVSS base score for an OSV severity value, which
+// is published either as a bare number ("9.8") or as a vector string.
+//
+// The bool reports whether a score could be DERIVED, which callers must
+// distinguish from a low score. CVSS v2 and v4 vectors match OSV's type field
+// but use scoring algorithms this does not implement; conflating "cannot
+// compute" with "scored medium" discarded accurate severity labels.
+func cvssBaseScore(score string) (float64, bool) {
+	// A bare number, as some databases publish.
+	if f, err := strconv.ParseFloat(score, 64); err == nil {
+		return f, true
 	}
 
+	// OSV publishes CVSS as a vector string, e.g.
+	// "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H". The base score is not
+	// embedded in it, but it is fully determined by it, so compute it.
+	return cvssV3BaseScore(score)
+}
+
+// scoreToSeverity buckets a CVSS base score using the standard qualitative
+// severity rating scale.
+func scoreToSeverity(f float64) findings.Severity {
 	switch {
 	case f >= 9.0:
 		return findings.SeverityCritical
@@ -218,6 +129,16 @@ func cvssToSeverity(score string) findings.Severity {
 	default:
 		return findings.SeverityInfo
 	}
+}
+
+// cvssToSeverity converts a CVSS vector string or numeric score to a Severity,
+// falling back to medium when no score can be derived.
+func cvssToSeverity(score string) findings.Severity {
+	f, ok := cvssBaseScore(score)
+	if !ok {
+		return findings.SeverityMedium
+	}
+	return scoreToSeverity(f)
 }
 
 // upgradeCommand returns the canonical one-liner an operator can run to
@@ -244,27 +165,12 @@ func upgradeCommand(ecosystem, pkg, fixedVer string) string {
 	}
 }
 
-// ecosystemToOSV maps nox's internal ecosystem names to the ecosystem strings
-// expected by the OSV.dev API.
-func ecosystemToOSV(eco string) string {
-	switch eco {
-	case "go":
-		return "Go"
-	case "npm":
-		return "npm"
-	case "pypi":
-		return "PyPI"
-	case "rubygems":
-		return "RubyGems"
-	case "cargo":
-		return "crates.io"
-	case "maven":
-		return "Maven"
-	case "gradle":
-		return "Maven"
-	case "nuget":
-		return "NuGet"
-	default:
-		return eco
-	}
-}
+// osvEcosystem reports the OSV ecosystem string for a nox ecosystem name, and
+// whether OSV recognises it at all. Delegated to the wire implementation, which
+// owns the vocabulary.
+func osvEcosystem(eco string) (string, bool) { return osv.Ecosystem(eco) }
+
+// ecosystemToOSV maps a nox ecosystem name to OSV's, returning the input
+// unchanged for ecosystems OSV does not recognise. Used only for best-effort
+// matching within already-returned records, never to issue queries.
+func ecosystemToOSV(eco string) string { return osv.EcosystemName(eco) }

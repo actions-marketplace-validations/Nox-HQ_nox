@@ -11,9 +11,9 @@ import (
 	"text/tabwriter"
 	"time"
 
+	nox "github.com/nox-hq/nox/core"
 	"github.com/nox-hq/nox/plugin"
 	"github.com/nox-hq/nox/registry"
-	nox "github.com/nox-hq/nox/core"
 	"github.com/nox-hq/nox/registry/oci"
 	"github.com/nox-hq/nox/registry/trust"
 )
@@ -79,6 +79,26 @@ func newOCIStoreWithPolicy(policyName string) *oci.Store {
 		oci.WithCacheDir(cacheDir),
 		oci.WithVerifier(verifier),
 	)
+}
+
+// trustViolationsBlock is the single trust-policy gate shared by the install
+// and update paths. Store.Fetch is fail-open by contract: it records policy
+// violations in VerifyResult but still returns a runnable BinaryPath, delegating
+// enforcement to the caller. Having each caller re-implement that check is how
+// `nox plugin update` came to silently install artifacts `nox plugin install`
+// would refuse — so both now route through here.
+//
+// It returns the violation messages to surface and whether they are fatal under
+// the policy (never fatal for a permissive policy or an explicit
+// --allow-unverified). No violations ⇒ (nil, false).
+func trustViolationsBlock(vr trust.VerifyResult, policyName string, allowUnverified bool) (msgs []string, fatal bool) {
+	if len(vr.Violations) == 0 {
+		return nil, false
+	}
+	for _, v := range vr.Violations {
+		msgs = append(msgs, v.Message)
+	}
+	return msgs, !allowUnverified && policyName != "permissive"
 }
 
 // policyFromName resolves a config / flag string into a trust.Policy.
@@ -184,10 +204,36 @@ func runPluginSearch(args []string) int {
 		if track == "" {
 			track = "-"
 		}
-		_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", p.Name, track, p.Description, latest)
+		desc := p.Description
+		if p.Deprecated {
+			desc = "[DEPRECATED] " + desc
+		}
+		_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", p.Name, track, desc, latest)
 	}
 	_ = w.Flush()
+
+	// Migration notices go to stderr so the table on stdout stays pipeable.
+	for i := range results {
+		warnIfDeprecated(&results[i])
+	}
 	return 0
+}
+
+// warnIfDeprecated prints a migration notice for a retired plugin.
+//
+// The registry carried "deprecated" and "deprecation_note" for two releases
+// before anything read them, so search and install happily kept recommending
+// retired plugins. The warning is advisory and never blocks: existing installs
+// must keep working.
+func warnIfDeprecated(p *registry.PluginEntry) {
+	if p == nil || !p.Deprecated {
+		return
+	}
+	if p.DeprecationNote != "" {
+		fmt.Fprintf(os.Stderr, "warning: %s is deprecated — %s\n", p.Name, p.DeprecationNote)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "warning: %s is deprecated and no longer maintained\n", p.Name)
 }
 
 // runPluginInfo shows detailed information about a plugin.
@@ -234,6 +280,13 @@ func runPluginInfo(args []string) int {
 
 	fmt.Printf("Name:        %s\n", found.Name)
 	fmt.Printf("Description: %s\n", found.Description)
+	if found.Deprecated {
+		note := found.DeprecationNote
+		if note == "" {
+			note = "no longer maintained"
+		}
+		fmt.Printf("Status:      DEPRECATED — %s\n", note)
+	}
 	if found.Track != "" {
 		fmt.Printf("Track:       %s\n", found.Track)
 	}
@@ -286,18 +339,40 @@ func runPluginInstall(args []string) int {
 	fs.BoolVar(&requireVerified, "require-verified", false, "fail install when signer key is not in the local keyring")
 	fs.BoolVar(&allowUnverified, "allow-unverified", false, "accept unsigned artifacts (overrides .nox.yaml trust_policy)")
 	fs.StringVar(&policyOverride, "trust-policy", "", "override trust policy: permissive, default, enterprise")
+	var localPath string
+	fs.StringVar(&localPath, "local", "", "install an unsigned plugin binary from a local path (development only)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 
 	rest := fs.Args()
+	if localPath != "" {
+		if len(rest) < 1 {
+			fmt.Fprintln(os.Stderr, "Usage: nox plugin install --local <path> <name>")
+			return 2
+		}
+		return installLocalPlugin(rest[0], localPath)
+	}
 	if len(rest) < 1 {
-		fmt.Fprintln(os.Stderr, "Usage: nox plugin install [--require-signature|--require-verified|--allow-unverified] <name[@version]>")
+		fmt.Fprintln(os.Stderr, "Usage: nox plugin install [--require-signature|--require-verified|--allow-unverified] <name[@version]> | --local <path> <name>")
 		return 2
 	}
 
 	nameVer := rest[0]
 	name, constraint := parseNameVersion(nameVer)
+
+	// Validate before the name reaches registry resolution or the on-disk
+	// store. The URI and MCP install paths already gate on these; the direct
+	// CLI path did not, so a traversal/injection payload in a plugin ref went
+	// straight through. Same allowlist, now enforced on every install path.
+	if !plugin.IsSafeName(name) {
+		fmt.Fprintf(os.Stderr, "error: unsafe plugin name %q\n", name)
+		return 2
+	}
+	if constraint != "*" && !plugin.IsSafeVersionConstraint(constraint) {
+		fmt.Fprintf(os.Stderr, "error: unsafe version constraint %q\n", constraint)
+		return 2
+	}
 
 	statePath := DefaultStatePath()
 	st, err := LoadState(statePath)
@@ -328,6 +403,17 @@ func runPluginInstall(args []string) int {
 		return 2
 	}
 
+	// Warn before downloading, but do not block: retired plugins must stay
+	// installable so existing pipelines keep working.
+	if entries, searchErr := client.Search(ctx, name); searchErr == nil {
+		for i := range entries {
+			if entries[i].Name == name {
+				warnIfDeprecated(&entries[i])
+				break
+			}
+		}
+	}
+
 	// If already installed at the resolved version, skip.
 	if ip := st.FindPlugin(name); ip != nil && ip.Version == ve.Version {
 		fmt.Printf("%s@%s is already installed.\n", name, ve.Version)
@@ -347,14 +433,13 @@ func runPluginInstall(args []string) int {
 	}
 	fmt.Println()
 
-	if len(artifact.VerifyResult.Violations) > 0 {
-		fatal := !allowUnverified && policyName != "permissive"
-		for _, v := range artifact.VerifyResult.Violations {
+	if msgs, fatal := trustViolationsBlock(artifact.VerifyResult, policyName, allowUnverified); len(msgs) > 0 {
+		for _, m := range msgs {
 			label := "warning"
 			if fatal {
 				label = "error"
 			}
-			fmt.Fprintf(os.Stderr, "  %s: %s\n", label, v.Message)
+			fmt.Fprintf(os.Stderr, "  %s: %s\n", label, m)
 		}
 		if fatal {
 			fmt.Fprintf(os.Stderr, "Install blocked by trust policy %q. Override with --allow-unverified or set plugins.trust_policy: permissive in .nox.yaml.\n", policyName)
@@ -363,16 +448,19 @@ func runPluginInstall(args []string) int {
 	}
 
 	now := time.Now()
-	st.AddPlugin(&InstalledPlugin{
+	ip := &InstalledPlugin{
 		Name:        name,
 		Version:     ve.Version,
 		Digest:      artifact.Digest,
 		BinaryPath:  artifact.BinaryPath,
 		TrustLevel:  trustLevel,
 		RiskClass:   ve.RiskClass,
+		Track:       string(trackForPlugin(ctx, client, name)),
 		InstalledAt: now,
 		UpdatedAt:   now,
-	})
+	}
+	ip.RecordBinaryDigest()
+	st.AddPlugin(ip)
 
 	if err := SaveState(statePath, st); err != nil {
 		fmt.Fprintf(os.Stderr, "error: saving state: %v\n", err)
@@ -380,6 +468,16 @@ func runPluginInstall(args []string) int {
 	}
 
 	fmt.Printf("Installed %s@%s (%s)\n", name, ve.Version, trustLevel)
+
+	// Installing is a machine-level action; enabling is a project-level one.
+	// Saying so here is the difference between a user's next scan working and
+	// them concluding the plugin found nothing. Only shown when the project
+	// does not already require it, so the common case stays quiet. See #376.
+	if cwd, wdErr := os.Getwd(); wdErr == nil {
+		if !projectEnablesPlugin(requiredPluginsForDir(cwd), name) {
+			fmt.Print(enablePluginHint(name))
+		}
+	}
 	return 0
 }
 
@@ -413,7 +511,14 @@ func runPluginUpdate(args []string) int {
 	}
 
 	client := newRegistryClient(st)
-	store := newOCIStore()
+	// Update must enforce the same trust policy as install. It previously used
+	// the permissive-by-construction default store and never inspected
+	// VerifyResult, so a higher version published in a configured registry — or
+	// a MITM'd/stale unsigned index — was installed unverified. Resolve the
+	// operator's policy (.nox.yaml plugins.trust_policy, else "default") and
+	// build a policy-aware store so violations are both produced and gated.
+	policyName := resolveTrustPolicy("", false, false, false)
+	store := newOCIStoreWithPolicy(policyName)
 	ctx := context.Background()
 
 	updated := 0
@@ -441,17 +546,30 @@ func runPluginUpdate(args []string) int {
 			continue
 		}
 
+		// Fail closed: a new version that violates the trust policy is skipped,
+		// not silently installed. The currently-installed version stays in place.
+		if msgs, fatal := trustViolationsBlock(artifact.VerifyResult, policyName, false); fatal {
+			for _, m := range msgs {
+				fmt.Fprintf(os.Stderr, "warning: not updating %s@%s: %s\n", name, ve.Version, m)
+			}
+			fmt.Fprintf(os.Stderr, "Skipped %s: new version blocked by trust policy %q (run `nox plugin install %s@%s --allow-unverified` to override).\n", name, policyName, name, ve.Version)
+			continue
+		}
+
 		now := time.Now()
-		st.AddPlugin(&InstalledPlugin{
+		newIP := &InstalledPlugin{
 			Name:        name,
 			Version:     ve.Version,
 			Digest:      artifact.Digest,
 			BinaryPath:  artifact.BinaryPath,
 			TrustLevel:  artifact.VerifyResult.Level.String(),
 			RiskClass:   ve.RiskClass,
+			Track:       string(trackForPlugin(ctx, client, name)),
 			InstalledAt: ip.InstalledAt,
 			UpdatedAt:   now,
-		})
+		}
+		newIP.RecordBinaryDigest()
+		st.AddPlugin(newIP)
 		updated++
 		fmt.Printf("Updated %s: %s -> %s\n", name, ip.Version, ve.Version)
 	}
@@ -487,13 +605,37 @@ func runPluginList(args []string) int {
 		return 0
 	}
 
+	// ACTIVE answers the question the other four columns cannot: whether this
+	// plugin will actually run here. Installed-but-not-required is a normal
+	// state, not an error, but it is indistinguishable from "enabled and found
+	// nothing" once a scan comes back quiet. See #376.
+	cwd, err := os.Getwd()
+	if err != nil {
+		cwd = "."
+	}
+	required := requiredPluginsForDir(cwd)
+
+	var inactive int
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	_, _ = fmt.Fprintln(w, "NAME\tVERSION\tTRUST\tINSTALLED")
+	_, _ = fmt.Fprintln(w, "NAME\tVERSION\tTRUST\tINSTALLED\tACTIVE HERE")
 	for i := range st.Plugins {
 		p := &st.Plugins[i]
-		_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", p.Name, p.Version, p.TrustLevel, p.InstalledAt.Format("2006-01-02"))
+		active := "no"
+		if projectEnablesPlugin(required, p.Name) {
+			active = "yes"
+		} else {
+			inactive++
+		}
+		_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n",
+			p.Name, p.Version, p.TrustLevel, p.InstalledAt.Format("2006-01-02"), active)
 	}
 	_ = w.Flush()
+
+	if inactive > 0 {
+		fmt.Printf("\n%d installed plugin(s) will not run in this directory: they are not listed\n"+
+			"under plugins.required in .nox.yaml. Plugins are opt-in per project so that a\n"+
+			"scan does not depend on what happens to be installed on the machine.\n", inactive)
+	}
 	return 0
 }
 
@@ -640,4 +782,72 @@ func parseNameVersion(s string) (name, constraint string) {
 		return s[:idx], s[idx+1:]
 	}
 	return s, "*"
+}
+
+// installLocalPlugin registers a plugin binary straight from disk.
+//
+// Plugin development previously had no way to run a locally built plugin: the
+// only install path resolves a name against a registry, downloads a published
+// artifact and verifies its signature. That made even a one-line plugin change
+// untestable without cutting a release first, which is a poor loop and pushes
+// people toward editing ~/.nox/state.json by hand.
+//
+// The binary is recorded with TrustLevel "local" and no digest, so it is never
+// mistaken for a verified marketplace artifact: `nox plugin list` shows it as
+// local, and nothing here consults or relaxes the trust policy, because there
+// is no signature to reason about. Nothing about the SAFETY policy changes —
+// a locally installed plugin is validated against the same policy at
+// registration and per-tool at invocation as any other.
+func installLocalPlugin(name, path string) int {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: resolving %s: %v\n", path, err)
+		return 2
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 2
+	}
+	if info.IsDir() {
+		fmt.Fprintf(os.Stderr, "error: %s is a directory; pass the built plugin binary\n", abs)
+		return 2
+	}
+	// Executable bit checked up front: registration would otherwise fail later
+	// with a confusing exec error.
+	if info.Mode()&0o111 == 0 {
+		fmt.Fprintf(os.Stderr, "error: %s is not executable\n", abs)
+		return 2
+	}
+
+	statePath := DefaultStatePath()
+	st, err := LoadState(statePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: loading state: %v\n", err)
+		return 2
+	}
+
+	now := time.Now()
+	localIP := &InstalledPlugin{
+		Name:        name,
+		Version:     "local",
+		BinaryPath:  abs,
+		TrustLevel:  "local",
+		InstalledAt: now,
+		UpdatedAt:   now,
+	}
+	// Record the digest even for local plugins: it does not imply marketplace
+	// trust (TrustLevel stays "local"), but it still lets the scan path detect
+	// if this binary is swapped out from under an installed reference.
+	localIP.RecordBinaryDigest()
+	st.AddPlugin(localIP)
+	if err := SaveState(statePath, st); err != nil {
+		fmt.Fprintf(os.Stderr, "error: saving state: %v\n", err)
+		return 2
+	}
+
+	fmt.Printf("Installed %s from %s (trust: local, UNSIGNED)\n", name, abs)
+	fmt.Fprintln(os.Stderr, "warning: local plugins are unsigned and unverified — for development only. "+
+		"Reinstall from the marketplace (nox plugin install "+name+") to return to a verified build.")
+	return 0
 }

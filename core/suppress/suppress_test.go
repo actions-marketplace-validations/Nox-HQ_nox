@@ -302,3 +302,203 @@ func TestScanForSuppressions_DisableTrailingComment(t *testing.T) {
 		t.Errorf("line = %d, want 1 (trailing comment applies to same line)", supps[0].Line)
 	}
 }
+
+// A nox:ignore inside a fenced code block in markdown is documentation showing
+// the syntax, not a waiver anyone expects to apply. It is flagged so the caller
+// can skip reporting it as unused — but it must still parse and still match, so
+// a genuine waiver written in a doc keeps working.
+func TestScanForSuppressions_MarkdownFenceIsDocExample(t *testing.T) {
+	md := "# Docs\n\nExample:\n\n```go\n// nox:ignore SEC-001 -- shown in docs\nvar k = \"AKIAEXAMPLEFAKEKEY\"\n```\n\n<!-- nox:ignore SEC-002 -- a real waiver, outside any fence -->\nreal line\n"
+
+	got := ScanForSuppressions([]byte(md), "README.md")
+	if len(got) != 2 {
+		t.Fatalf("expected 2 suppressions, got %d: %+v", len(got), got)
+	}
+	byRule := map[string]Suppression{}
+	for _, s := range got {
+		byRule[s.RuleIDs[0]] = s
+	}
+	if !byRule["SEC-001"].DocExample {
+		t.Error("directive inside a fenced block should be marked DocExample")
+	}
+	if byRule["SEC-002"].DocExample {
+		t.Error("directive outside a fence must NOT be marked DocExample")
+	}
+	// Marking must not disturb matching: the fenced one still targets its line.
+	if !byRule["SEC-001"].MatchesFinding("SEC-001", byRule["SEC-001"].Line, time.Now()) {
+		t.Error("a fenced directive must still match a finding on its target line")
+	}
+}
+
+// The same directive in a non-markdown file is never a doc example.
+func TestScanForSuppressions_FenceOnlyAppliesToMarkdown(t *testing.T) {
+	src := "```\n// nox:ignore SEC-001 -- not markdown\nvar k = 1\n"
+	got := ScanForSuppressions([]byte(src), "main.go")
+	if len(got) != 1 {
+		t.Fatalf("expected 1 suppression, got %d", len(got))
+	}
+	if got[0].DocExample {
+		t.Error("backticks in a .go file must not mark a directive as a doc example")
+	}
+}
+
+// `nox:ignore` appearing in PROSE or in a STRING LITERAL is documentation
+// about the syntax, not a waiver. Both forms were parsed as real directives,
+// and because a waiver that matches nothing is reported, nox produced false
+// "waives X but matched no finding" degradations against its own source —
+// the instrumentation accusing correct code of carrying dead waivers.
+//
+// The two real instances, both from nox's own tree:
+//
+//   - a doc comment that wrapped so the phrase "…holds no nox:ignore comments,
+//     so nothing was missed" began a line, parsed as waiving rule "comments";
+//   - pre-commit help text, `echo "nox: use '// nox:ignore RULE-ID -- reason'"`,
+//     parsed as waiving rule "RULE-ID".
+//
+// A directive's grammar is `nox:ignore <IDs> [-- reason]`: after the rule IDs
+// the line must end, close the comment, or introduce a reason with `--`.
+// Free prose after the IDs means the text is describing a directive, not
+// issuing one. And a directive inside a string literal is a program printing
+// the syntax, never a waiver on the string's own line.
+func TestScanForSuppressions_ProseAndStringsAreNotDirectives(t *testing.T) {
+	cases := []struct {
+		name, path, line string
+		want             bool // true = a real directive
+	}{
+		{
+			name: "prose: wrapped doc comment mentioning the directive",
+			path: "scan.go",
+			line: "\t\t// nox:ignore comments, so nothing was missed and nothing is reported.",
+			want: false,
+		},
+		{
+			name: "string literal: help text teaching the syntax",
+			path: "protect_cmd.go",
+			line: `    echo "nox: use '// nox:ignore RULE-ID -- reason' to suppress false positives"`,
+			want: false,
+		},
+		// Everything below is a real waiver and must keep working.
+		{
+			name: "real: rule id with reason",
+			path: "scan.go",
+			line: "\tfoo() // nox:ignore SEC-163 -- em dash in string not hex",
+			want: true,
+		},
+		{
+			name: "real: bare rule id, end of line",
+			path: "scan.go",
+			line: "\t// nox:ignore IAC-123",
+			want: true,
+		},
+		{
+			name: "real: comma-separated list",
+			path: "server.go",
+			line: "\t// nox:ignore SEC-659,SEC-506,SEC-574,SEC-664 -- reviewed",
+			want: true,
+		},
+		{
+			name: "real: space-separated list with reason",
+			path: "corpus.go",
+			line: "\tX = \"y\" // nox:ignore SEC-161 SEC-162 SEC-163 -- test canary, not a live secret",
+			want: true,
+		},
+		{
+			name: "real: yaml hash comment",
+			path: "ci.yml",
+			line: "  contents: write # nox:ignore IAC-314 -- needed for releases",
+			want: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ScanForSuppressions([]byte(tc.line+"\n"), tc.path)
+			isDirective := len(got) > 0 && !got[0].DocExample
+			if isDirective != tc.want {
+				t.Errorf("directive=%v, want %v\n  line: %s\n  parsed: %+v", isDirective, tc.want, tc.line, got)
+			}
+		})
+	}
+}
+
+// A directive nested inside a comment that already started the line is an
+// EXAMPLE, not a waiver: this package's own doc comment lists the supported
+// spellings (`//\t// nox:ignore SEC-001 -- …`), and a comment describing the
+// parser quotes one inline. Both were read as live directives.
+//
+// It stayed invisible while the unused-waiver check only looked at files that
+// already had a finding; sweeping clean files surfaced six of them in this one
+// file. DocExample already existed for markdown fenced blocks — the same idea,
+// extended to the code blocks and inline quotes that appear in source comments.
+//
+// Marking, not dropping: a doc example still matches a finding on its target
+// line exactly as a markdown one does. It is only excluded from "this waiver
+// suppresses nothing", where it would be pure noise.
+func TestScanForSuppressions_NestedInCommentIsDocExample(t *testing.T) {
+	cases := []struct {
+		name, path, line string
+		wantDoc          bool
+	}{
+		{
+			name:    "go doc comment code block",
+			path:    "suppress.go",
+			line:    "//\t// nox:ignore SEC-001 -- false positive in test",
+			wantDoc: true,
+		},
+		{
+			name:    "go doc comment listing the yaml spelling",
+			path:    "suppress.go",
+			line:    "//\t# nox:ignore SEC-001,SEC-002",
+			wantDoc: true,
+		},
+		{
+			name:    "go doc comment listing the html spelling",
+			path:    "suppress.go",
+			line:    "//\t<!-- nox:ignore AI-001 -->",
+			wantDoc: true,
+		},
+		{
+			name:    "prose comment quoting a directive inline",
+			path:    "suppress.go",
+			line:    "\t// contains `echo \"nox: use '// nox:ignore RULE-ID -- reason'\"`, which was",
+			wantDoc: true,
+		},
+		// Real waivers: the directive's own marker starts the comment.
+		{
+			name:    "real: own-line directive",
+			path:    "main.go",
+			line:    "\t\t// nox:ignore IAC-123 -- reviewed",
+			wantDoc: false,
+		},
+		{
+			name:    "real: trailing directive after code",
+			path:    "main.go",
+			line:    "\tfoo() // nox:ignore SEC-163 -- em dash not hex",
+			wantDoc: false,
+		},
+		{
+			name:    "real: yaml trailing directive",
+			path:    "ci.yml",
+			line:    "  contents: write # nox:ignore IAC-314 -- needed for releases",
+			wantDoc: false,
+		},
+		{
+			name:    "real: yaml own-line directive",
+			path:    "ci.yml",
+			line:    "# nox:ignore SEC-001,SEC-002 -- reviewed",
+			wantDoc: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ScanForSuppressions([]byte(tc.line+"\n"), tc.path)
+			if len(got) == 0 {
+				t.Fatalf("no directive parsed at all from: %s", tc.line)
+			}
+			if got[0].DocExample != tc.wantDoc {
+				t.Errorf("DocExample=%v, want %v\n  line: %s", got[0].DocExample, tc.wantDoc, tc.line)
+			}
+		})
+	}
+}

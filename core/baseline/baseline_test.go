@@ -274,3 +274,67 @@ func TestBuildIndex_RebuildsCorrectly(t *testing.T) {
 		t.Fatal("expected match for fp2 after rebuild")
 	}
 }
+
+// TestMatch_AliasFingerprintFromARetiredRuleID: a baseline entry written when
+// the condition was reported under a now-retired rule ID must keep matching.
+// Anything else silently un-baselines findings an operator accepted.
+func TestMatch_AliasFingerprintFromARetiredRuleID(t *testing.T) {
+	bl := &Baseline{}
+	bl.Add(&Entry{Fingerprint: "legacy-fp", RuleID: "IAC-310", CreatedAt: time.Now()})
+
+	f := findings.Finding{
+		RuleID:            "IAC-018",
+		Fingerprint:       "current-fp",
+		RetiredRuleIDs:    []string{"IAC-310"},
+		AliasFingerprints: []string{"legacy-fp"},
+	}
+	if bl.Match(&f) == nil {
+		t.Fatal("the entry written against the retired IAC-310 no longer matches")
+	}
+
+	// The alias is not a wildcard: a finding that inherited nothing is unmatched.
+	plain := findings.Finding{RuleID: "IAC-018", Fingerprint: "current-fp"}
+	if bl.Match(&plain) != nil {
+		t.Error("a finding with no alias matched an unrelated entry")
+	}
+}
+
+// TestMatch_ExpiredAliasEntryDoesNotMatch: expiry is a property of the entry,
+// not of the lookup path it was found through.
+func TestMatch_ExpiredAliasEntryDoesNotMatch(t *testing.T) {
+	past := time.Now().Add(-24 * time.Hour)
+	bl := &Baseline{}
+	bl.Add(&Entry{Fingerprint: "legacy-fp", RuleID: "IAC-310", CreatedAt: past, ExpiresAt: &past})
+
+	f := findings.Finding{
+		RuleID:            "IAC-018",
+		Fingerprint:       "current-fp",
+		RetiredRuleIDs:    []string{"IAC-310"},
+		AliasFingerprints: []string{"legacy-fp"},
+	}
+	if bl.Match(&f) != nil {
+		t.Error("an expired entry matched through the alias path")
+	}
+}
+
+func TestBaselineStatus(t *testing.T) {
+	b := &Baseline{}
+	b.Entries = []Entry{
+		{Fingerprint: "a", Severity: findings.SeverityHigh},
+		{Fingerprint: "b", Severity: findings.SeverityHigh},
+		{Fingerprint: "c", Severity: findings.SeverityCritical},
+	}
+	st := b.Status()
+	if st.Total != 3 {
+		t.Errorf("Total = %d, want 3", st.Total)
+	}
+	if st.BySeverity[findings.SeverityHigh] != 2 || st.BySeverity[findings.SeverityCritical] != 1 {
+		t.Errorf("BySeverity wrong: %+v", st.BySeverity)
+	}
+	// Rendering in canonical order must be deterministic — the CLI's old loop
+	// iterated a map non-deterministically.
+	got := findings.FormatSeverityCounts(st.BySeverity)
+	if got != "1 critical, 2 high" {
+		t.Errorf("formatted = %q, want %q", got, "1 critical, 2 high")
+	}
+}

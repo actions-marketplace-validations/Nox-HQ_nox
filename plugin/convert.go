@@ -1,30 +1,45 @@
 package plugin
 
 import (
+	"fmt"
+
 	"github.com/nox-hq/nox/core"
 	"github.com/nox-hq/nox/core/analyzers/ai"
 	"github.com/nox-hq/nox/core/analyzers/deps"
 	"github.com/nox-hq/nox/core/findings"
 	"github.com/nox-hq/nox/core/graph"
 	pluginv1 "github.com/nox-hq/nox/gen/nox/plugin/v1"
+	"github.com/nox-hq/nox/sdk"
 )
 
 // --- Proto → Go conversion ---
 
 // ProtoFindingToGo converts a protobuf Finding to the domain Finding type.
-func ProtoFindingToGo(pf *pluginv1.Finding) findings.Finding {
+//
+// pluginName identifies the plugin that produced the finding; it namespaces the
+// fingerprint so a plugin cannot reach outside its own findings. See
+// pluginFingerprint.
+//
+// workspaceRoot is the directory the plugin was pointed at. Plugins commonly
+// report absolute paths, so the location is made relative to it BEFORE the
+// fingerprint is computed. Without that, a plugin finding's fingerprint moved
+// with the checkout directory and could not be baselined anywhere the path was
+// not byte-identical — every CI runner, every git-worktree gate, any two
+// developers (#454). Pass "" to skip normalisation.
+func ProtoFindingToGo(pf *pluginv1.Finding, pluginName, workspaceRoot string) findings.Finding {
 	if pf == nil {
 		return findings.Finding{}
 	}
 	f := findings.Finding{
-		ID:          pf.GetId(),
-		RuleID:      pf.GetRuleId(),
-		Severity:    ProtoSeverityToGo(pf.GetSeverity()),
-		Confidence:  ProtoConfidenceToGo(pf.GetConfidence()),
-		Location:    ProtoLocationToGo(pf.GetLocation()),
-		Message:     pf.GetMessage(),
-		Fingerprint: pf.GetFingerprint(),
+		ID:         pf.GetId(),
+		RuleID:     pf.GetRuleId(),
+		Severity:   ProtoSeverityToGo(pf.GetSeverity()),
+		Confidence: ProtoConfidenceToGo(pf.GetConfidence()),
+		Location:   ProtoLocationToGo(pf.GetLocation()),
+		Message:    pf.GetMessage(),
 	}
+	f.Location.FilePath = repoRelativePath(f.Location.FilePath, workspaceRoot)
+	f.Fingerprint = pluginFingerprint(pluginName, pf.GetRuleId(), pf.GetFingerprint(), f)
 	if m := pf.GetMetadata(); len(m) > 0 {
 		f.Metadata = make(map[string]string, len(m))
 		for k, v := range m {
@@ -32,6 +47,59 @@ func ProtoFindingToGo(pf *pluginv1.Finding) findings.Finding {
 		}
 	}
 	return f
+}
+
+// repoRelativePath rewrites an absolute plugin-reported path to one relative to
+// root, so a finding identifies a file in the repository rather than a location
+// on the machine that scanned it.
+//
+// It delegates to sdk.RelativePath, the helper plugin authors are told to use,
+// so the host and the plugins agree on what a repo-relative path is. Two
+// implementations of this drifted once already: this one returned native
+// separators while the SDK's returned slashes, which on Windows gave a plugin
+// finding `internal\svc\handler.go` where every other nox path is
+// `internal/svc/handler.go`. That made the fingerprint differ between Windows
+// and Linux for the same file in the same repository — the #454 bug again,
+// across operating systems instead of across directories — and left
+// forward-slash exclude patterns unable to match plugin paths.
+func repoRelativePath(path, root string) string {
+	return sdk.RelativePath(root, path)
+}
+
+// pluginFingerprint derives the fingerprint stored for a plugin finding.
+//
+// A plugin's claimed fingerprint cannot be used as-is. Plugin findings merge
+// into the same FindingSet as core findings and are then deduplicated
+// first-wins, and baseline and VEX suppression key on the same value. A plugin
+// could therefore claim a fingerprint matching a core finding and erase it, or
+// claim one matching a baselined finding and hide itself.
+//
+// So the value is recomputed host-side using the core scheme — which keeps
+// determinism, path normalisation and fingerprint-version parity — with the
+// rule ID namespaced by plugin name. The plugin's claim is demoted to hash
+// input, tagged so a claimed fingerprint and a message can never alias. That
+// preserves the one legitimate use of the claim: deciding which of a plugin's
+// own findings are "the same" across runs, so they stay baseline-able.
+func pluginFingerprint(pluginName, ruleID, claimed string, f findings.Finding) string {
+	// Length-prefixed rather than delimited.
+	//
+	// A delimiter is only unambiguous if it cannot appear in the components,
+	// and nothing enforces that here: the plugin name comes from the plugin's
+	// own GetManifest response and the rule ID from the finding it emitted, so
+	// both are attacker-controlled. A colon separator collided outright
+	// ("acme" + "sql:injection" versus "acme:sql" + "injection"), and moving to
+	// NUL only made the same collision require a NUL-bearing name — proto3
+	// strings are UTF-8, which permits NUL. Length prefixes remove the class:
+	// no choice of name or rule ID can produce another pair's encoding.
+	namespaced := fmt.Sprintf("plugin\x00%d:%s\x00%d:%s",
+		len(pluginName), pluginName, len(ruleID), ruleID)
+
+	identity := "msg:" + f.Message
+	if claimed != "" {
+		identity = "fp:" + claimed
+	}
+
+	return findings.ComputeFingerprint(namespaced, f.Location, identity)
 }
 
 // ProtoLocationToGo converts a protobuf Location to the domain Location type.
@@ -432,4 +500,17 @@ func GoScanResultToProtoContext(r *core.ScanResult) *pluginv1.ScanContext {
 		}
 	}
 	return sc
+}
+
+// AttributedResponse pairs a plugin response with the name of the plugin that
+// produced it.
+//
+// The response message itself carries no producer identity, but the host needs
+// it at merge time to namespace fingerprints — see pluginFingerprint. Carrying
+// it alongside is simpler than widening the wire format, and keeps the
+// attribution authoritative: it comes from the host's own registry rather than
+// from anything the plugin says about itself.
+type AttributedResponse struct {
+	PluginName string
+	Response   *pluginv1.InvokeToolResponse
 }

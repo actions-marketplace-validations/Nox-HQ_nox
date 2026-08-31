@@ -7,7 +7,7 @@ import (
 
 func runCompletion(args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "Usage: nox completion <bash|zsh|fish|powershell>") // nox:ignore AI-006 -- CLI usage text
+		fmt.Fprintln(os.Stderr, "Usage: nox completion <bash|zsh|fish|powershell>")
 		return 2
 	}
 
@@ -36,7 +36,7 @@ _nox_completions() {
     COMPREPLY=()
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    commands="scan show explain badge serve registry plugin version baseline diff watch protect completion annotate"
+    commands="scan show explain confirm attack badge serve registry plugin version baseline diff watch protect completion annotate"
 
     case "${prev}" in
         nox)
@@ -80,6 +80,8 @@ _nox() {
         'scan:Scan a directory for security issues'
         'show:Inspect findings interactively'
         'explain:Explain findings using an LLM'
+        'confirm:ACTIVE dynamic confirmation of AI prompt-injection findings'
+        'attack:Plan, run, replay and regress dynamic exploit validation'
         'badge:Generate an SVG status badge'
         'serve:Start MCP server on stdio'
         'registry:Manage plugin registries'
@@ -117,6 +119,9 @@ _nox() {
                 protect)
                     _values 'subcommand' install uninstall status
                     ;;
+                attack)
+                    _values 'subcommand' plan run replay regress
+                    ;;
                 completion)
                     _values 'shell' bash zsh fish powershell
                     ;;
@@ -132,6 +137,8 @@ const fishCompletion = `# nox fish completion
 complete -c nox -n '__fish_use_subcommand' -a 'scan' -d 'Scan a directory for security issues'
 complete -c nox -n '__fish_use_subcommand' -a 'show' -d 'Inspect findings interactively'
 complete -c nox -n '__fish_use_subcommand' -a 'explain' -d 'Explain findings using an LLM'
+complete -c nox -n '__fish_use_subcommand' -a 'confirm' -d 'ACTIVE dynamic confirmation of AI prompt-injection findings'
+complete -c nox -n '__fish_use_subcommand' -a 'attack' -d 'Plan, run, replay and regress dynamic exploit validation'
 complete -c nox -n '__fish_use_subcommand' -a 'badge' -d 'Generate an SVG status badge'
 complete -c nox -n '__fish_use_subcommand' -a 'serve' -d 'Start MCP server on stdio'
 complete -c nox -n '__fish_use_subcommand' -a 'registry' -d 'Manage plugin registries'
@@ -157,7 +164,7 @@ const powershellCompletion = `# nox PowerShell completion
 Register-ArgumentCompleter -CommandName nox -ScriptBlock {
     param($wordToComplete, $commandAst, $cursorPosition)
 
-    $commands = @('scan', 'show', 'explain', 'badge', 'serve', 'registry', 'plugin', 'version', 'baseline', 'diff', 'watch', 'protect', 'completion', 'annotate')
+    $commands = @('scan', 'show', 'explain', 'confirm', 'attack', 'badge', 'serve', 'registry', 'plugin', 'version', 'baseline', 'diff', 'watch', 'protect', 'completion', 'annotate')
 
     $commands | Where-Object { $_ -like "$wordToComplete*" } | ForEach-Object {
         [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)

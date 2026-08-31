@@ -11,9 +11,15 @@ import (
 	"strings"
 	"testing"
 
-	mcp "github.com/felixgeelhaar/mcp-go"
+	"github.com/nox-hq/nox/core/dashboard"
+
+	nox "github.com/nox-hq/nox/core"
+	"github.com/nox-hq/nox/core/analyzers/ai"
+	"github.com/nox-hq/nox/core/analyzers/deps"
+	findingspkg "github.com/nox-hq/nox/core/findings"
 	pluginv1 "github.com/nox-hq/nox/gen/nox/plugin/v1"
 	"github.com/nox-hq/nox/plugin"
+	mcp "go.klarlabs.de/mcp"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"
@@ -636,23 +642,6 @@ func TestHandlePluginCallTool_Alias(t *testing.T) {
 	}
 }
 
-func TestHandlePluginReadResource_Stub(t *testing.T) {
-	s := New("0.1.0", nil)
-	result, err := s.handlePluginReadResource(context.Background(), pluginReadResourceInput{
-		Plugin: "test",
-		URI:    "nox://test/results",
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !strings.HasPrefix(result, "Error:") {
-		t.Fatal("expected error for stub")
-	}
-	if !strings.Contains(result, "not yet implemented") {
-		t.Fatalf("expected 'not yet implemented' message, got: %s", result)
-	}
-}
-
 // --- handleGetFindingDetail tests ---
 
 func TestHandleGetFindingDetail_BeforeScan(t *testing.T) {
@@ -661,11 +650,11 @@ func TestHandleGetFindingDetail_BeforeScan(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.HasPrefix(result, "Error:") {
+	if !strings.HasPrefix(textOf(result), "Error:") {
 		t.Fatal("expected error before any scan")
 	}
-	if !strings.Contains(result, "no scan results") {
-		t.Fatalf("expected no-scan-results message, got: %s", result)
+	if !strings.Contains(textOf(result), "no scan results") {
+		t.Fatalf("expected no-scan-results message, got: %s", textOf(result))
 	}
 }
 
@@ -675,11 +664,11 @@ func TestHandleGetFindingDetail_MissingFindingID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.HasPrefix(result, "Error:") {
+	if !strings.HasPrefix(textOf(result), "Error:") {
 		t.Fatal("expected error for missing finding_id")
 	}
-	if !strings.Contains(result, "missing required argument: finding_id") {
-		t.Fatalf("expected missing argument message, got: %s", result)
+	if !strings.Contains(textOf(result), "missing required argument: finding_id") {
+		t.Fatalf("expected missing argument message, got: %s", textOf(result))
 	}
 }
 
@@ -689,11 +678,11 @@ func TestHandleGetFindingDetail_FindingNotFound(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.HasPrefix(result, "Error:") {
+	if !strings.HasPrefix(textOf(result), "Error:") {
 		t.Fatal("expected error for nonexistent finding")
 	}
-	if !strings.Contains(result, "not found") {
-		t.Fatalf("expected not found message, got: %s", result)
+	if !strings.Contains(textOf(result), "not found") {
+		t.Fatalf("expected not found message, got: %s", textOf(result))
 	}
 }
 
@@ -724,14 +713,14 @@ func TestHandleGetFindingDetail_Success(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if strings.HasPrefix(result, "Error:") {
-		t.Fatalf("expected success, got: %s", result)
+	if strings.HasPrefix(textOf(result), "Error:") {
+		t.Fatalf("expected success, got: %s", textOf(result))
 	}
-	if !strings.Contains(result, findingID) {
-		t.Fatalf("expected finding ID in response, got: %s", result)
+	if !strings.Contains(textOf(result), findingID) {
+		t.Fatalf("expected finding ID in response, got: %s", textOf(result))
 	}
-	if !strings.Contains(result, `"source"`) {
-		t.Fatalf("expected source in response, got: %s", result)
+	if !strings.Contains(textOf(result), `"source"`) {
+		t.Fatalf("expected source in response, got: %s", textOf(result))
 	}
 }
 
@@ -743,11 +732,11 @@ func TestHandleListFindings_BeforeScan(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.HasPrefix(result, "Error:") {
+	if !strings.HasPrefix(textOf(result), "Error:") {
 		t.Fatal("expected error before any scan")
 	}
-	if !strings.Contains(result, "no scan results") {
-		t.Fatalf("expected no-scan-results message, got: %s", result)
+	if !strings.Contains(textOf(result), "no scan results") {
+		t.Fatalf("expected no-scan-results message, got: %s", textOf(result))
 	}
 }
 
@@ -765,11 +754,11 @@ func TestHandleListFindings_NoFilters(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if strings.HasPrefix(result, "Error:") {
-		t.Fatalf("expected success, got: %s", result)
+	if strings.HasPrefix(textOf(result), "Error:") {
+		t.Fatalf("expected success, got: %s", textOf(result))
 	}
-	if !strings.Contains(result, `"RuleID"`) {
-		t.Fatalf("expected RuleID in findings, got: %s", result)
+	if !strings.Contains(textOf(result), `"RuleID"`) {
+		t.Fatalf("expected RuleID in findings, got: %s", textOf(result))
 	}
 }
 
@@ -789,11 +778,11 @@ func TestHandleListFindings_WithSeverityFilter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if strings.HasPrefix(result, "Error:") {
-		t.Fatalf("expected success, got: %s", result)
+	if strings.HasPrefix(textOf(result), "Error:") {
+		t.Fatalf("expected success, got: %s", textOf(result))
 	}
-	if !strings.Contains(result, `"Severity"`) {
-		t.Fatalf("expected Severity field in findings, got: %s", result)
+	if !strings.Contains(textOf(result), `"Severity"`) {
+		t.Fatalf("expected Severity field in findings, got: %s", textOf(result))
 	}
 }
 
@@ -813,11 +802,11 @@ func TestHandleListFindings_WithRuleFilter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if strings.HasPrefix(result, "Error:") {
-		t.Fatalf("expected success, got: %s", result)
+	if strings.HasPrefix(textOf(result), "Error:") {
+		t.Fatalf("expected success, got: %s", textOf(result))
 	}
-	if !strings.Contains(result, `"RuleID"`) {
-		t.Fatalf("expected RuleID in findings, got: %s", result)
+	if !strings.Contains(textOf(result), `"RuleID"`) {
+		t.Fatalf("expected RuleID in findings, got: %s", textOf(result))
 	}
 }
 
@@ -837,11 +826,11 @@ func TestHandleListFindings_WithFileFilter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if strings.HasPrefix(result, "Error:") {
-		t.Fatalf("expected success, got: %s", result)
+	if strings.HasPrefix(textOf(result), "Error:") {
+		t.Fatalf("expected success, got: %s", textOf(result))
 	}
-	if !strings.Contains(result, "config.env") {
-		t.Fatalf("expected config.env in findings, got: %s", result)
+	if !strings.Contains(textOf(result), "config.env") {
+		t.Fatalf("expected config.env in findings, got: %s", textOf(result))
 	}
 }
 
@@ -861,11 +850,11 @@ func TestHandleListFindings_WithLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if strings.HasPrefix(result, "Error:") {
-		t.Fatalf("expected success, got: %s", result)
+	if strings.HasPrefix(textOf(result), "Error:") {
+		t.Fatalf("expected success, got: %s", textOf(result))
 	}
-	if !strings.Contains(result, `"RuleID"`) {
-		t.Fatalf("expected findings in response, got: %s", result)
+	if !strings.Contains(textOf(result), `"RuleID"`) {
+		t.Fatalf("expected findings in response, got: %s", textOf(result))
 	}
 }
 
@@ -891,10 +880,10 @@ func TestHandleListFindings_SuppressedFilter(t *testing.T) {
 	}
 
 	// Verify that include_suppressed parameter exists and works.
-	if strings.Contains(allResult, `"RuleID"`) {
-		t.Logf("Found %d bytes in all findings response", len(allResult))
+	if strings.Contains(textOf(allResult), `"RuleID"`) {
+		t.Logf("Found %d bytes in all findings response", len(textOf(allResult)))
 	}
-	if len(defaultResult) <= len("[]") {
+	if len(textOf(defaultResult)) <= len("[]") {
 		t.Log("Default response correctly filters findings")
 	}
 }
@@ -907,11 +896,11 @@ func TestHandleBaselineStatus_MissingPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.HasPrefix(result, "Error:") {
+	if !strings.HasPrefix(textOf(result), "Error:") {
 		t.Fatal("expected error for missing path")
 	}
-	if !strings.Contains(result, "missing required argument: path") {
-		t.Fatalf("expected missing path message, got: %s", result)
+	if !strings.Contains(textOf(result), "missing required argument: path") {
+		t.Fatalf("expected missing path message, got: %s", textOf(result))
 	}
 }
 
@@ -921,11 +910,11 @@ func TestHandleBaselineStatus_DisallowedPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.HasPrefix(result, "Error:") {
+	if !strings.HasPrefix(textOf(result), "Error:") {
 		t.Fatal("expected error for disallowed path")
 	}
-	if !strings.Contains(result, "outside allowed workspaces") {
-		t.Fatalf("expected workspace error, got: %s", result)
+	if !strings.Contains(textOf(result), "outside allowed workspaces") {
+		t.Fatalf("expected workspace error, got: %s", textOf(result))
 	}
 }
 
@@ -936,11 +925,11 @@ func TestHandleBaselineStatus_NoBaseline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if strings.HasPrefix(result, "Error:") {
-		t.Fatalf("expected success (empty baseline), got: %s", result)
+	if strings.HasPrefix(textOf(result), "Error:") {
+		t.Fatalf("expected success (empty baseline), got: %s", textOf(result))
 	}
-	if !strings.Contains(result, `"total":0`) && !strings.Contains(result, `"total": 0`) {
-		t.Fatalf("expected total:0 for empty baseline, got: %s", result)
+	if !strings.Contains(textOf(result), `"total":0`) && !strings.Contains(textOf(result), `"total": 0`) {
+		t.Fatalf("expected total:0 for empty baseline, got: %s", textOf(result))
 	}
 }
 
@@ -974,14 +963,14 @@ func TestHandleBaselineStatus_WithBaseline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if strings.HasPrefix(result, "Error:") {
-		t.Fatalf("expected success, got: %s", result)
+	if strings.HasPrefix(textOf(result), "Error:") {
+		t.Fatalf("expected success, got: %s", textOf(result))
 	}
-	if !strings.Contains(result, `"total":1`) && !strings.Contains(result, `"total": 1`) {
-		t.Fatalf("expected total:1, got: %s", result)
+	if !strings.Contains(textOf(result), `"total":1`) && !strings.Contains(textOf(result), `"total": 1`) {
+		t.Fatalf("expected total:1, got: %s", textOf(result))
 	}
-	if !strings.Contains(result, `"high"`) {
-		t.Fatalf("expected severity breakdown, got: %s", result)
+	if !strings.Contains(textOf(result), `"high"`) {
+		t.Fatalf("expected severity breakdown, got: %s", textOf(result))
 	}
 }
 
@@ -1154,8 +1143,8 @@ func TestHandleBaselineAdd_InvalidatesCachedStatus(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list_findings failed: %v", err)
 	}
-	if strings.Contains(listed, fp) {
-		t.Fatalf("list_findings still returned the baselined fingerprint:\n%s", listed)
+	if strings.Contains(textOf(listed), fp) {
+		t.Fatalf("list_findings still returned the baselined fingerprint:\n%s", textOf(listed))
 	}
 }
 
@@ -1227,7 +1216,7 @@ func TestHandleFixPlan_StatusNoVulns(t *testing.T) {
 		t.Fatalf("fix_plan failed: %v", err)
 	}
 	var resp fixPlanResponse
-	if err := json.Unmarshal([]byte(out), &resp); err != nil {
+	if err := json.Unmarshal([]byte(textOf(out)), &resp); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
 	if resp.Status != fixPlanStatusNoVulns {
@@ -1249,11 +1238,11 @@ func TestHandleVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if strings.HasPrefix(result, "Error:") {
-		t.Fatalf("expected success, got: %s", result)
+	if strings.HasPrefix(textOf(result), "Error:") {
+		t.Fatalf("expected success, got: %s", textOf(result))
 	}
-	if !strings.Contains(result, "1.2.3") {
-		t.Fatalf("expected version in response, got: %s", result)
+	if !strings.Contains(textOf(result), "1.2.3") {
+		t.Fatalf("expected version in response, got: %s", textOf(result))
 	}
 }
 
@@ -1265,12 +1254,13 @@ func TestHandleRules(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if strings.HasPrefix(result, "Error:") {
-		t.Fatalf("expected success, got: %s", result)
+	text := textOf(result)
+	if strings.HasPrefix(text, "Error:") {
+		t.Fatalf("expected success, got: %s", text)
 	}
 	// Should contain at least one known rule ID.
-	if !strings.Contains(result, "SEC-") && !strings.Contains(result, "AI-") && !strings.Contains(result, "IAC-") {
-		t.Fatalf("expected rule IDs in response, got: %s", result[:min(len(result), 200)])
+	if !strings.Contains(text, "SEC-") && !strings.Contains(text, "AI-") && !strings.Contains(text, "IAC-") {
+		t.Fatalf("expected rule IDs in response, got: %s", text[:min(len(text), 200)])
 	}
 }
 
@@ -1370,11 +1360,11 @@ func TestHandleDiff_MissingPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.HasPrefix(result, "Error:") {
+	if !strings.HasPrefix(textOf(result), "Error:") {
 		t.Fatal("expected error for missing path")
 	}
-	if !strings.Contains(result, "missing required argument: path") {
-		t.Fatalf("expected missing path message, got: %s", result)
+	if !strings.Contains(textOf(result), "missing required argument: path") {
+		t.Fatalf("expected missing path message, got: %s", textOf(result))
 	}
 }
 
@@ -1384,11 +1374,11 @@ func TestHandleDiff_DisallowedPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.HasPrefix(result, "Error:") {
+	if !strings.HasPrefix(textOf(result), "Error:") {
 		t.Fatal("expected error for disallowed path")
 	}
-	if !strings.Contains(result, "outside allowed workspaces") {
-		t.Fatalf("expected workspace error, got: %s", result)
+	if !strings.Contains(textOf(result), "outside allowed workspaces") {
+		t.Fatalf("expected workspace error, got: %s", textOf(result))
 	}
 }
 
@@ -1399,11 +1389,11 @@ func TestHandleDiff_NonGitRepo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.HasPrefix(result, "Error:") {
+	if !strings.HasPrefix(textOf(result), "Error:") {
 		t.Fatal("expected error for non-git directory")
 	}
-	if !strings.Contains(result, "diff failed") {
-		t.Fatalf("expected diff failed message, got: %s", result)
+	if !strings.Contains(textOf(result), "diff failed") {
+		t.Fatalf("expected diff failed message, got: %s", textOf(result))
 	}
 }
 
@@ -1484,11 +1474,11 @@ func TestHandleVEXStatus_MissingPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.HasPrefix(result, "Error:") {
+	if !strings.HasPrefix(textOf(result), "Error:") {
 		t.Fatal("expected error for missing path")
 	}
-	if !strings.Contains(result, "missing required argument: path") {
-		t.Fatalf("expected missing path message, got: %s", result)
+	if !strings.Contains(textOf(result), "missing required argument: path") {
+		t.Fatalf("expected missing path message, got: %s", textOf(result))
 	}
 }
 
@@ -1510,17 +1500,18 @@ func TestHandleVEXStatus_Success(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if strings.HasPrefix(result, "Error:") {
-		t.Fatalf("expected success, got: %s", result)
+	text := textOf(result)
+	if strings.HasPrefix(text, "Error:") {
+		t.Fatalf("expected success, got: %s", text)
 	}
-	if !strings.Contains(result, `"statements": 2`) && !strings.Contains(result, `"statements":2`) {
-		t.Fatalf("expected statements count, got: %s", result)
+	if !strings.Contains(text, `"statements": 2`) && !strings.Contains(text, `"statements":2`) {
+		t.Fatalf("expected statements count, got: %s", text)
 	}
-	if !strings.Contains(result, "not_affected") || !strings.Contains(result, "fixed") {
-		t.Fatalf("expected status breakdown, got: %s", result)
+	if !strings.Contains(text, "not_affected") || !strings.Contains(text, "fixed") {
+		t.Fatalf("expected status breakdown, got: %s", text)
 	}
-	if !strings.Contains(result, "VEX: 2 statements") {
-		t.Fatalf("expected summary, got: %s", result)
+	if !strings.Contains(text, "VEX: 2 statements") {
+		t.Fatalf("expected summary, got: %s", text)
 	}
 }
 
@@ -1532,11 +1523,11 @@ func TestHandleDataSensitivityReport_NoScanResults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.HasPrefix(result, "Error:") {
+	if !strings.HasPrefix(textOf(result), "Error:") {
 		t.Fatal("expected error before any scan")
 	}
-	if !strings.Contains(result, "no scan results") {
-		t.Fatalf("expected no-scan-results message, got: %s", result)
+	if !strings.Contains(textOf(result), "no scan results") {
+		t.Fatalf("expected no-scan-results message, got: %s", textOf(result))
 	}
 }
 
@@ -1554,8 +1545,8 @@ func TestHandleDataSensitivityReport_WithFindings(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if strings.HasPrefix(result, "Error:") {
-		t.Fatalf("expected success, got: %s", result)
+	if strings.HasPrefix(textOf(result), "Error:") {
+		t.Fatalf("expected success, got: %s", textOf(result))
 	}
 
 	var report struct {
@@ -1568,7 +1559,7 @@ func TestHandleDataSensitivityReport_WithFindings(t *testing.T) {
 		AffectedFiles []string `json:"affected_files"`
 	}
 
-	if err := json.Unmarshal([]byte(result), &report); err != nil {
+	if err := json.Unmarshal([]byte(textOf(result)), &report); err != nil {
 		t.Fatalf("failed to parse report JSON: %v", err)
 	}
 	if report.TotalFindings == 0 {
@@ -1683,6 +1674,95 @@ func TestHandleDashboard_AfterScan(t *testing.T) {
 	}
 	if !strings.Contains(result, "<html") {
 		t.Fatalf("expected HTML content in dashboard")
+	}
+}
+
+// oversizedScanResult builds a ScanResult whose dashboard HTML exceeds
+// maxOutputBytes, used to exercise the output-size cap on the dashboard
+// handlers. The findings carry long messages so the rendered HTML crosses the
+// 1MB response budget.
+func oversizedScanResult(t *testing.T) *nox.ScanResult {
+	t.Helper()
+	fs := findingspkg.NewFindingSet()
+	msg := strings.Repeat("boundary violation in prompt context ", 4)
+	for i := 0; i < 20000; i++ {
+		fs.Add(findingspkg.NewFinding(
+			"SEC-100",
+			findingspkg.SeverityHigh,
+			findingspkg.ConfidenceHigh,
+			findingspkg.Location{FilePath: "cmd/service/handler.go", StartLine: i + 1, EndLine: i + 1},
+			msg,
+		))
+	}
+	return &nox.ScanResult{
+		Findings:    fs,
+		Inventory:   &deps.PackageInventory{},
+		AIInventory: ai.NewInventory(),
+	}
+}
+
+func TestGenerateDashboardHTML_OversizedExceedsBudget(t *testing.T) {
+	html, err := dashboard.GenerateHTML(oversizedScanResult(t), "0.1.0", t.TempDir())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(html) <= maxOutputBytes {
+		t.Fatalf("expected oversized dashboard HTML > %d bytes, got %d", maxOutputBytes, len(html))
+	}
+}
+
+func TestHandleDashboard_OversizedReturnsNotice(t *testing.T) {
+	s := New("0.1.0", nil)
+	dir := t.TempDir()
+	s.setCache(dir, oversizedScanResult(t))
+
+	result, err := s.handleDashboard(context.Background(), dashboardInput{Path: dir})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(result) > maxOutputBytes {
+		t.Fatalf("dashboard response exceeded output budget: %d > %d bytes", len(result), maxOutputBytes)
+	}
+	if !strings.Contains(result, "output_too_large") {
+		t.Fatalf("expected structured output_too_large notice, got: %s", result[:min(len(result), 200)])
+	}
+}
+
+func TestHandleResourceDashboard_OversizedReturnsNotice(t *testing.T) {
+	s := New("0.1.0", nil)
+	dir := t.TempDir()
+	s.setCache(dir, oversizedScanResult(t))
+
+	content, err := s.handleResourceDashboard(context.Background(), "nox://dashboard", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(content.Text) > maxOutputBytes {
+		t.Fatalf("dashboard resource exceeded output budget: %d > %d bytes", len(content.Text), maxOutputBytes)
+	}
+	if !strings.Contains(content.Text, "output_too_large") {
+		t.Fatalf("expected structured output_too_large notice, got: %s", content.Text[:min(len(content.Text), 200)])
+	}
+}
+
+func TestHandleProjectResourceDashboard_OversizedReturnsNotice(t *testing.T) {
+	s := New("0.1.0", nil)
+	dir := t.TempDir()
+	s.setCache(dir, oversizedScanResult(t))
+
+	content, err := s.handleProjectResourceDashboard(
+		context.Background(),
+		"nox://projects/x/dashboard",
+		map[string]string{"project": dir},
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(content.Text) > maxOutputBytes {
+		t.Fatalf("project dashboard resource exceeded output budget: %d > %d bytes", len(content.Text), maxOutputBytes)
+	}
+	if !strings.Contains(content.Text, "output_too_large") {
+		t.Fatalf("expected structured output_too_large notice, got: %s", content.Text[:min(len(content.Text), 200)])
 	}
 }
 
@@ -1814,8 +1894,8 @@ func TestHandleFixPlan_NoScan(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.HasPrefix(result, "Error:") || !strings.Contains(result, "no scan results") {
-		t.Fatalf("expected no-scan-results error, got: %s", result)
+	if !strings.HasPrefix(textOf(result), "Error:") || !strings.Contains(textOf(result), "no scan results") {
+		t.Fatalf("expected no-scan-results error, got: %s", textOf(result))
 	}
 }
 
@@ -1825,11 +1905,11 @@ func TestHandleFixPlan_AfterScan(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if strings.HasPrefix(result, "Error:") {
-		t.Fatalf("expected success, got: %s", result)
+	if strings.HasPrefix(textOf(result), "Error:") {
+		t.Fatalf("expected success, got: %s", textOf(result))
 	}
-	if !strings.Contains(result, `"actions"`) {
-		t.Fatalf("expected actions key in response, got: %s", result)
+	if !strings.Contains(textOf(result), `"actions"`) {
+		t.Fatalf("expected actions key in response, got: %s", textOf(result))
 	}
 }
 
@@ -1854,21 +1934,6 @@ func TestHandleAgentGraph_NoAgents(t *testing.T) {
 	if !strings.Contains(result, "No agent tool registrations") &&
 		!strings.HasPrefix(result, "graph LR") {
 		t.Fatalf("expected no-agents message or empty mermaid, got: %s", result)
-	}
-}
-
-func TestMajorOfVersion(t *testing.T) {
-	cases := map[string]string{
-		"v1.2.3": "1",
-		"1.2.3":  "1",
-		"v2.0.0": "2",
-		"":       "",
-		"1":      "1",
-	}
-	for in, want := range cases {
-		if got := majorOfVersion(in); got != want {
-			t.Errorf("majorOfVersion(%q) = %q, want %q", in, got, want)
-		}
 	}
 }
 
@@ -1903,36 +1968,6 @@ func TestHandlePluginInstall_RequiresConfirmation(t *testing.T) {
 	}
 }
 
-func TestIsSafePluginName(t *testing.T) {
-	good := []string{"nox/ai-eval", "nox/reachability", "acme/secret-scanner-v2", "nox-plugin-foo"}
-	bad := []string{"", "foo;bar", "foo bar", "foo$(x)", "foo|bar", "../foo", strings.Repeat("a", 201)}
-	for _, n := range good {
-		if !isSafePluginName(n) {
-			t.Errorf("safe name rejected: %q", n)
-		}
-	}
-	for _, n := range bad {
-		if isSafePluginName(n) {
-			t.Errorf("unsafe name accepted: %q", n)
-		}
-	}
-}
-
-func TestIsSafeVersionConstraint(t *testing.T) {
-	good := []string{"1.2.3", "v1.2.3", ">=0.5", "^1.0.0", "~1.2", "1.0.0-beta+build"}
-	bad := []string{"1.2; rm -rf", "1.0.0`whoami`", "$(x)", "../1.0"}
-	for _, v := range good {
-		if !isSafeVersionConstraint(v) {
-			t.Errorf("safe version rejected: %q", v)
-		}
-	}
-	for _, v := range bad {
-		if isSafeVersionConstraint(v) {
-			t.Errorf("unsafe version accepted: %q", v)
-		}
-	}
-}
-
 func TestProjectResourceDashboard_AfterScan(t *testing.T) {
 	s, absPath := scanDirWithPath(t)
 	encoded := url.PathEscape(absPath)
@@ -1945,5 +1980,233 @@ func TestProjectResourceDashboard_AfterScan(t *testing.T) {
 	}
 	if !strings.Contains(content.Text, "<html") {
 		t.Fatalf("expected HTML content")
+	}
+}
+
+func TestHandleListFindings_Pagination(t *testing.T) {
+	dir := t.TempDir()
+	// Several distinct secrets across rules → several findings to page through.
+	// AWS keys are AKIA + 16 chars from [A-Z2-7]; use two valid, distinct ones
+	// plus a private-key header.
+	writeFile(t, dir, "secrets.env",
+		"A=AKIAIOSFODNN7EXAMPLE\nB=AKIAWXYZ234567ABCDEF\n")
+	writeFile(t, dir, "id_rsa",
+		"-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA\n-----END RSA PRIVATE KEY-----\n")
+
+	s := New("0.1.0", nil)
+	if r, err := s.handleScan(context.Background(), scanInput{Path: dir}); err != nil || strings.HasPrefix(r, "Error:") {
+		t.Fatalf("scan failed: %v / %s", err, r)
+	}
+
+	type page struct {
+		Total, Offset, Limit, Returned int
+		HasMore                        bool                     `json:"has_more"`
+		Findings                       []map[string]interface{} `json:"findings"`
+	}
+	get := func(limit, offset int) page {
+		out, err := s.handleListFindings(context.Background(),
+			listFindingsInput{Limit: float64(limit), Offset: float64(offset)})
+		if err != nil || strings.HasPrefix(textOf(out), "Error:") {
+			t.Fatalf("list failed: %v / %s", err, textOf(out))
+		}
+		var p page
+		if err := json.Unmarshal([]byte(textOf(out)), &p); err != nil {
+			t.Fatalf("envelope not valid JSON: %v\n%s", err, textOf(out))
+		}
+		return p
+	}
+
+	first := get(2, 0)
+	if first.Total < 3 {
+		t.Fatalf("expected >=3 findings to paginate, total=%d", first.Total)
+	}
+	if first.Returned != 2 || first.Limit != 2 || first.Offset != 0 || !first.HasMore {
+		t.Fatalf("unexpected first page: %+v", first)
+	}
+
+	second := get(2, 2)
+	if second.Total != first.Total {
+		t.Errorf("total changed across pages: %d vs %d", first.Total, second.Total)
+	}
+	if second.Offset != 2 {
+		t.Errorf("expected offset 2, got %d", second.Offset)
+	}
+	// Pages must not overlap (stable order).
+	firstIDs := map[string]bool{}
+	for _, f := range first.Findings {
+		firstIDs[f["ID"].(string)] = true
+	}
+	for _, f := range second.Findings {
+		if firstIDs[f["ID"].(string)] {
+			t.Errorf("finding %v appears on both pages", f["ID"])
+		}
+	}
+
+	// Offset past the end yields an empty page, not an error.
+	beyond := get(10, 1000)
+	if beyond.Returned != 0 || beyond.HasMore {
+		t.Errorf("expected empty final page, got %+v", beyond)
+	}
+}
+
+func TestHandleSummary(t *testing.T) {
+	// Before any scan.
+	s := New("0.1.0", nil)
+	if r, _ := s.handleSummary(context.Background(), emptyInput{}); !strings.HasPrefix(textOf(r), "Error:") {
+		t.Fatal("expected error before scan")
+	}
+
+	dir := t.TempDir()
+	writeFile(t, dir, "secrets.env", "A=AKIAIOSFODNN7EXAMPLE\n")
+	writeFile(t, dir, "id_rsa", "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA\n-----END RSA PRIVATE KEY-----\n")
+	if r, err := s.handleScan(context.Background(), scanInput{Path: dir}); err != nil || strings.HasPrefix(r, "Error:") {
+		t.Fatalf("scan failed: %v / %s", err, r)
+	}
+
+	out, err := s.handleSummary(context.Background(), emptyInput{})
+	if err != nil || strings.HasPrefix(textOf(out), "Error:") {
+		t.Fatalf("summary failed: %v / %s", err, textOf(out))
+	}
+	var sum struct {
+		ActiveFindings int            `json:"active_findings"`
+		TotalFindings  int            `json:"total_findings"`
+		BySeverity     map[string]int `json:"by_severity"`
+		ByFamily       map[string]int `json:"by_family"`
+	}
+	if err := json.Unmarshal([]byte(textOf(out)), &sum); err != nil {
+		t.Fatalf("summary not valid JSON: %v\n%s", err, textOf(out))
+	}
+	if sum.ActiveFindings < 2 {
+		t.Fatalf("expected >=2 active findings, got %d", sum.ActiveFindings)
+	}
+	if sum.ByFamily["secrets"] < 2 {
+		t.Errorf("expected secrets family count >=2, got %v", sum.ByFamily)
+	}
+	// counts must sum to active total.
+	sevSum := 0
+	for _, n := range sum.BySeverity {
+		sevSum += n
+	}
+	if sevSum != sum.ActiveFindings {
+		t.Errorf("severity counts %d != active findings %d", sevSum, sum.ActiveFindings)
+	}
+}
+
+func TestHandleFindingByFingerprint(t *testing.T) {
+	s := New("0.1.0", nil)
+	// Missing arg.
+	if r, _ := s.handleFindingByFingerprint(context.Background(), findingByFingerprintInput{}); !strings.HasPrefix(textOf(r), "Error:") {
+		t.Fatal("expected error for empty fingerprint")
+	}
+
+	dir := t.TempDir()
+	writeFile(t, dir, "config.env", "AWS_KEY=AKIAIOSFODNN7EXAMPLE\n")
+	if r, err := s.handleScan(context.Background(), scanInput{Path: dir}); err != nil || strings.HasPrefix(r, "Error:") {
+		t.Fatalf("scan failed: %v / %s", err, r)
+	}
+
+	// Pull one finding's fingerprint via list_findings.
+	listOut, _ := s.handleListFindings(context.Background(), listFindingsInput{})
+	var env struct {
+		Findings []struct {
+			Fingerprint string `json:"Fingerprint"`
+		} `json:"findings"`
+	}
+	if err := json.Unmarshal([]byte(textOf(listOut)), &env); err != nil || len(env.Findings) == 0 {
+		t.Fatalf("could not get a fingerprint: %v\n%s", err, textOf(listOut))
+	}
+	fp := env.Findings[0].Fingerprint
+
+	// Full fingerprint → found.
+	out, err := s.handleFindingByFingerprint(context.Background(), findingByFingerprintInput{Fingerprint: fp})
+	if err != nil {
+		t.Fatalf("lookup error: %v", err)
+	}
+	var found struct {
+		Found  bool   `json:"found"`
+		Status string `json:"status"`
+		RuleID string `json:"rule_id"`
+	}
+	if err := json.Unmarshal([]byte(textOf(out)), &found); err != nil {
+		t.Fatalf("not valid JSON: %v\n%s", err, textOf(out))
+	}
+	if !found.Found || found.Status != "new" {
+		t.Errorf("expected found+new, got %+v", found)
+	}
+
+	// 12-char prefix → also found.
+	if len(fp) >= 12 {
+		out2, _ := s.handleFindingByFingerprint(context.Background(), findingByFingerprintInput{Fingerprint: fp[:12]})
+		if !strings.Contains(textOf(out2), `"found": true`) {
+			t.Errorf("prefix lookup should find the finding: %s", textOf(out2))
+		}
+	}
+
+	// Unknown fingerprint → found:false.
+	out3, _ := s.handleFindingByFingerprint(context.Background(), findingByFingerprintInput{Fingerprint: "deadbeefdeadbeef"})
+	if !strings.Contains(textOf(out3), `"found": false`) {
+		t.Errorf("expected found:false for unknown fp: %s", textOf(out3))
+	}
+}
+
+// depScanResult seeds a scan result with one VULN-001 finding carrying the
+// given upgrade metadata, so a fix_plan handler test can exercise the planner
+// without a real scan.
+func depScanResult(pkg, from, fixed string) *nox.ScanResult {
+	fs := findingspkg.NewFindingSet()
+	f := findingspkg.NewFinding("VULN-001", findingspkg.SeverityHigh, findingspkg.ConfidenceHigh,
+		findingspkg.Location{FilePath: "go.mod", StartLine: 1, EndLine: 1},
+		pkg+" is vulnerable")
+	f.Metadata = map[string]string{"ecosystem": "go", "package": pkg, "version": from, "fixed_in": fixed}
+	fs.Add(f)
+	return &nox.ScanResult{Findings: fs, Inventory: &deps.PackageInventory{}, AIInventory: ai.NewInventory()}
+}
+
+// The MCP fix_plan tool must refuse a downgrade, because it now shares the
+// core/fix planner with `nox fix`. Before consolidation this handler had no
+// such guard and would have presented an agent a fixed_in BELOW the installed
+// version as an actionable upgrade — a plan the CLI would never apply.
+func TestHandleFixPlan_RefusesDowngrade(t *testing.T) {
+	s := New("0.1.0", nil)
+	s.setCache("", depScanResult("golang.org/x/crypto", "0.54.0", "0.51.0"))
+
+	out, err := s.handleFixPlan(context.Background(), fixPlanInput{})
+	if err != nil {
+		t.Fatalf("fix_plan failed: %v", err)
+	}
+	var resp fixPlanResponse
+	if err := json.Unmarshal([]byte(textOf(out)), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(resp.Actions) != 0 {
+		t.Fatalf("MCP fix_plan planned a DOWNGRADE (0.54.0 -> 0.51.0): %+v", resp.Actions)
+	}
+	if resp.VulnCount != 1 {
+		t.Errorf("VulnCount = %d, want 1", resp.VulnCount)
+	}
+}
+
+// A genuine forward upgrade is still planned, with the operator-runnable command
+// the CLI would produce.
+func TestHandleFixPlan_PlansForwardUpgrade(t *testing.T) {
+	s := New("0.1.0", nil)
+	s.setCache("", depScanResult("golang.org/x/crypto", "0.51.0", "0.54.0"))
+
+	out, err := s.handleFixPlan(context.Background(), fixPlanInput{})
+	if err != nil {
+		t.Fatalf("fix_plan failed: %v", err)
+	}
+	var resp fixPlanResponse
+	if err := json.Unmarshal([]byte(textOf(out)), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(resp.Actions) != 1 {
+		t.Fatalf("expected 1 action, got %d", len(resp.Actions))
+	}
+	if resp.Actions[0].To != "0.54.0" {
+		t.Errorf("To = %s, want 0.54.0", resp.Actions[0].To)
+	}
+	if resp.Actions[0].Command == "" {
+		t.Error("forward upgrade must carry a runnable command")
 	}
 }

@@ -1,5 +1,9 @@
 # Scan-of-the-week rotation queue.
 #
+# Process: see docs/scan-of-the-week.md (runbook). The scan session is
+# network-restricted, so the target is PRE-CLONED and nox scans a local
+# path fully offline (--offline) — no egress-policy change needed (#136).
+#
 # Bi-weekly cadence, alphabetical-first selection. The /schedule
 # job pops the top non-comment line, runs `nox scan` on the repo,
 # writes a draft post to nox-hq.dev/src/content/blog/, then strikes
@@ -14,14 +18,15 @@
 # Refill via PR when this list runs short.
 
 # ── Q3 2026 ─────────────────────────────────────────────────────
-# DONE 2026-05-09: anthropics/anthropic-cookbook — 1.95M findings (mostly RAG-corpus FPs); precision-tuning post
-deepset-ai/haystack
-huggingface/smolagents
-langchain-ai/langgraph
-microsoft/autogen
-modelcontextprotocol/servers
-openai/openai-agents-python
-phidatahq/phidata
+# DONE 2026-04-26: modelcontextprotocol/python-sdk — series opener; 427 findings + 6-repo bench (anthropic-sdk-python, openai-python, agent-go, …); 0 disclosable
+# DONE 2026-05-10: anthropics/anthropic-cookbook — 1.95M findings (mostly RAG-corpus FPs); precision-tuning post
+# DONE 2026-05-24: deepset-ai/haystack — 12,367 findings (94% docs-website noise); 1 real low-sev (unredacted prompt log); fixed AI-009 ast.literal_eval FP
+# DONE 2026-06-07: huggingface/smolagents — 323 findings (65% from one example dir); 0 true positives; fixed VULN-002 PEP503 typosquat FP
+# DONE 2026-06-21: langchain-ai/langgraph — 134,614 findings (99.8% examples/ notebook image data + lockfile hashes); 0 true positives; fixed AI-019 DB-pipeline FP; MCP-011 docstring FP tracked
+# DONE 2026-07-05: microsoft/autogen — 304,629 findings (99.5% SVG/lock/notebook FPs); 1 low-sev AI-019 model-hash gap; fixed 10 broad-pattern SEC rules missing \b+secretShape
+# DONE 2026-07-15: modelcontextprotocol/servers — 41 findings (2 critical FPs: IAC-351 on id-token permission; 3 real high: mutable GH Action tags); fixed IAC-351 line-anchor FP
+# DONE 2026-08-01: openai/openai-agents-python — 378 findings (0 true positives); SEC-163 snake_case/f-string FP fixed
+# DONE 2026-08-15: phidatahq/phidata — 1,277 findings (53% cookbook examples); 0 true positives; AI-007 absence-notification FP fixed; MCP-009 guardrail-context FP tracked
 princeton-nlp/SWE-agent
 pydantic/pydantic-ai
 ragflow-io/ragflow

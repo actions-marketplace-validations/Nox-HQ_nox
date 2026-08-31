@@ -1,6 +1,7 @@
 package vex
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -306,5 +307,157 @@ func TestCollectVulnIDs(t *testing.T) {
 	ids2 := collectVulnIDs(&f2)
 	if len(ids2) != 0 {
 		t.Errorf("expected 0 IDs, got %d", len(ids2))
+	}
+}
+
+// TestStatement_AcceptsBothOpenVEXShapes covers the regression where a
+// spec-current v0.2.0 document was rejected outright. It failed at LOAD time,
+// before any scanning, so the practical effect was no scan at all — worse than
+// a scan with unapplied waivers, and indistinguishable from a clean one.
+func TestStatement_AcceptsBothOpenVEXShapes(t *testing.T) {
+	tests := []struct {
+		name     string
+		json     string
+		wantVuln string
+		wantProd []string
+	}{
+		{
+			name:     "v0.1.0 strings",
+			json:     `{"vulnerability":"CVE-2024-1234","products":["pkg:golang/example"],"status":"not_affected"}`,
+			wantVuln: "CVE-2024-1234",
+			wantProd: []string{"pkg:golang/example"},
+		},
+		{
+			name:     "v0.2.0 objects",
+			json:     `{"vulnerability":{"@id":"CVE-2024-1234","name":"CVE-2024-1234","description":"x"},"products":[{"@id":"pkg:golang/example"}],"status":"not_affected"}`,
+			wantVuln: "CVE-2024-1234",
+			wantProd: []string{"pkg:golang/example"},
+		},
+		{
+			name:     "object with only name falls back to it",
+			json:     `{"vulnerability":{"name":"AI-036"},"status":"not_affected"}`,
+			wantVuln: "AI-036",
+		},
+		{
+			name:     "@id wins over name, being the identity field",
+			json:     `{"vulnerability":{"@id":"CVE-2024-1234","name":"friendly label"},"status":"not_affected"}`,
+			wantVuln: "CVE-2024-1234",
+		},
+		{
+			name:     "a mixed array is tolerated rather than rejected",
+			json:     `{"vulnerability":"CVE-1","products":["pkg:a",{"@id":"pkg:b"}],"status":"fixed"}`,
+			wantVuln: "CVE-1",
+			wantProd: []string{"pkg:a", "pkg:b"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var got Statement
+			if err := json.Unmarshal([]byte(tc.json), &got); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if got.VulnerabilityID != tc.wantVuln {
+				t.Errorf("VulnerabilityID = %q, want %q", got.VulnerabilityID, tc.wantVuln)
+			}
+			if len(got.Products) != len(tc.wantProd) {
+				t.Fatalf("Products = %v, want %v", got.Products, tc.wantProd)
+			}
+			for i := range tc.wantProd {
+				if got.Products[i] != tc.wantProd[i] {
+					t.Errorf("Products[%d] = %q, want %q", i, got.Products[i], tc.wantProd[i])
+				}
+			}
+			// The other fields must still decode through the alias.
+			if got.Status != Status(map[bool]string{true: "fixed", false: "not_affected"}[tc.wantVuln == "CVE-1"]) {
+				t.Errorf("Status = %q — sibling fields must survive the custom unmarshaller", got.Status)
+			}
+		})
+	}
+}
+
+// TestStatement_RoundTripsThroughNoxsOwnWriter guards the half the issue also
+// flagged: whatever `nox baseline` emits must be readable by `nox scan -vex` in
+// the same release, or the two halves disagree.
+func TestStatement_RoundTripsThroughNoxsOwnWriter(t *testing.T) {
+	orig := Statement{VulnerabilityID: "CVE-2024-9999", Status: StatusNotAffected, Products: []string{"pkg:golang/x"}}
+	blob, err := json.Marshal(orig)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var back Statement
+	if err := json.Unmarshal(blob, &back); err != nil {
+		t.Fatalf("nox cannot read what nox wrote: %v", err)
+	}
+	if back.VulnerabilityID != orig.VulnerabilityID || len(back.Products) != 1 || back.Products[0] != orig.Products[0] {
+		t.Errorf("round trip lost data: %+v", back)
+	}
+}
+
+// TestApplyVEX_RetiredRuleID: a statement naming a rule ID that has since been
+// retired into another rule still applies to the surviving finding — otherwise
+// retiring a duplicate ID re-opens everything waived under it.
+func TestApplyVEX_RetiredRuleID(t *testing.T) {
+	fs := findings.NewFindingSet()
+	fs.Add(findings.Finding{
+		RuleID:         "IAC-018",
+		Fingerprint:    "current-fp",
+		Message:        "Workflow step suppresses failures with continue-on-error",
+		RetiredRuleIDs: []string{"IAC-310"},
+	})
+
+	doc := &Document{Statements: []Statement{{
+		VulnerabilityID: "IAC-310",
+		Status:          StatusNotAffected,
+		Justification:   "deliberately non-blocking step",
+	}}}
+	if applied := ApplyVEX(fs, doc); applied != 1 {
+		t.Fatalf("ApplyVEX applied %d statements, want 1", applied)
+	}
+	if got := fs.Findings()[0].Status; got != findings.StatusVEXNotAffected {
+		t.Errorf("status = %q, want %q", got, findings.StatusVEXNotAffected)
+	}
+}
+
+// TestApplyVEX_RetiredFingerprintPin: the same for an occurrence-pinned
+// statement, whose _nox_fingerprint was recorded under the retired ID.
+func TestApplyVEX_RetiredFingerprintPin(t *testing.T) {
+	fs := findings.NewFindingSet()
+	fs.Add(findings.Finding{
+		RuleID:            "IAC-018",
+		Fingerprint:       "current-fp",
+		Message:           "Workflow step suppresses failures with continue-on-error",
+		AliasFingerprints: []string{"legacy-fp"},
+	})
+
+	doc := &Document{Statements: []Statement{{
+		VulnerabilityID: "IAC-310",
+		Status:          StatusFixed,
+		NoxFingerprint:  "legacy-fp",
+	}}}
+	if applied := ApplyVEX(fs, doc); applied != 1 {
+		t.Fatalf("ApplyVEX applied %d statements, want 1", applied)
+	}
+	if got := fs.Findings()[0].Status; got != findings.StatusVEXFixed {
+		t.Errorf("status = %q, want %q", got, findings.StatusVEXFixed)
+	}
+}
+
+// TestApplyVEX_UnrelatedRetiredIDIsNotMatched: the alias is an exact ID list,
+// not a family match.
+func TestApplyVEX_UnrelatedRetiredIDIsNotMatched(t *testing.T) {
+	fs := findings.NewFindingSet()
+	fs.Add(findings.Finding{
+		RuleID:         "IAC-018",
+		Fingerprint:    "current-fp",
+		Message:        "Workflow step suppresses failures with continue-on-error",
+		RetiredRuleIDs: []string{"IAC-310"},
+	})
+
+	doc := &Document{Statements: []Statement{{
+		VulnerabilityID: "IAC-311",
+		Status:          StatusNotAffected,
+	}}}
+	if applied := ApplyVEX(fs, doc); applied != 0 {
+		t.Errorf("ApplyVEX applied %d statements for an unrelated ID, want 0", applied)
 	}
 }

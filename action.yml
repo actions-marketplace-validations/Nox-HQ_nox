@@ -46,6 +46,10 @@ inputs:
     description: 'Filter findings to those at or above this severity (critical, high, medium, low). Empty = no filter.'
     required: false
     default: ''
+  min-confidence:
+    description: 'Filter findings to those at or above this confidence (high, medium, low). Drops lower-confidence heuristic findings. Empty = no filter.'
+    required: false
+    default: ''
   vex:
     description: 'Path to OpenVEX waiver document (skips VEX-not-affected findings)'
     required: false
@@ -54,6 +58,14 @@ inputs:
     description: 'Scan only files changed since this git ref (e.g. origin/main). Empty = full scan.'
     required: false
     default: ''
+  offline:
+    description: 'Guarantee zero network: disable every feature that could make an outbound connection (no API, no token, no telemetry).'
+    required: false
+    default: 'false'
+  fail-on-degraded:
+    description: 'Fail the step if any check could not complete (OSV lookup, plugin, lockfile parse). A scan that could not look is otherwise indistinguishable from one that found nothing.'
+    required: false
+    default: 'false'
 
 outputs:
   findings-count:
@@ -66,16 +78,32 @@ outputs:
     description: 'Path to findings.json (if generated)'
     value: ${{ steps.scan.outputs.findings-file }}
   exit-code:
-    description: 'Raw nox exit code (0 = no findings, 1 = findings, 2 = error)'
+    description: 'Raw nox exit code (0 = no findings, 1 = findings, 2 = error, or an incomplete check under fail-on-degraded)'
     value: ${{ steps.scan.outputs.exit-code }}
 
 runs:
   using: 'composite'
   steps:
+    # nox verifies plugin signatures by shelling out to cosign; without it a
+    # signed plugin cannot be promoted past "unverified" and install is refused
+    # under the default community-trust policy. Only needed when the project
+    # declares plugins, so it is skipped for the common case of a repo with no
+    # .nox.yaml — keeping a plain scan as fast as it was.
+    - name: Install cosign (only when the project declares plugins)
+      if: hashFiles(format('{0}/.nox.yaml', inputs.path)) != ''
+      uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
     - name: Run Nox Security Scanner
       id: scan
-      shell: bash # nox:ignore IAC-193 -- composite GHA action, not Ansible
+      shell: bash
       env:
+        # A composite action's step sees only what this block maps. action.sh
+        # has always sent `Authorization: Bearer ${GITHUB_TOKEN}` when the
+        # variable is set, but nothing ever set it — so both the version lookup
+        # and the asset download went out anonymous, against the 60-per-hour
+        # budget shared by every job on the runner's IP, and were throttled with
+        # a 403 accordingly.
+        GITHUB_TOKEN: ${{ github.token }}
         INPUT_PATH: ${{ inputs.path }}
         INPUT_FORMAT: ${{ inputs.format }}
         INPUT_OUTPUT: ${{ inputs.output }}
@@ -86,6 +114,9 @@ runs:
         INPUT_MAX_COMMENTS: ${{ inputs.max-comments }}
         INPUT_MIN_SEVERITY: ${{ inputs.min-severity }}
         INPUT_SEVERITY_THRESHOLD: ${{ inputs.severity-threshold }}
+        INPUT_MIN_CONFIDENCE: ${{ inputs.min-confidence }}
         INPUT_VEX: ${{ inputs.vex }}
         INPUT_CHANGED_SINCE: ${{ inputs.changed-since }}
+        INPUT_OFFLINE: ${{ inputs.offline }}
+        INPUT_FAIL_ON_DEGRADED: ${{ inputs.fail-on-degraded }}
       run: bash "${{ github.action_path }}/action.sh"

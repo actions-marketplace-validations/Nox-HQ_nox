@@ -41,6 +41,66 @@ var base64Re = regexp.MustCompile(`[A-Za-z0-9+/=]{30,}`)
 // hexRe matches hexadecimal sequences of at least 32 characters.
 var hexRe = regexp.MustCompile(`[0-9a-fA-F]{32,}`)
 
+// candidateKind records which tokenizer produced a candidate. It is the
+// tokenizer, not the text, that decides: hex is a subset of the base64
+// alphabet, so re-testing a matched string cannot tell the two apart.
+//
+// A candidate carries the SET of kinds that found it, not one kind, because the
+// tokenizers genuinely overlap — `secret_key = xK9mR3pZ...` is both an
+// assignment RHS and a base64-shaped blob, and both descriptions are true. A
+// single kind would mean whichever tokenizer ran first stole the candidate from
+// the others, silently disabling the rules scoped to them.
+type candidateKind string
+
+// The kinds, one per tokenizer.
+const (
+	candidateQuoted     candidateKind = "quoted"
+	candidateAssignment candidateKind = "assignment"
+	candidateBase64     candidateKind = "base64"
+	candidateHex        candidateKind = "hex"
+)
+
+// candidateMatchesKinds reports whether a candidate found by the kinds in got is
+// one that a rule scoped to want should report. A rule that declares no kinds
+// (want == nil) takes everything, as every entropy rule did before kinds
+// existed.
+func candidateMatchesKinds(got, want map[candidateKind]bool) bool {
+	if want == nil {
+		return true
+	}
+	for k := range want {
+		if got[k] {
+			return true
+		}
+	}
+	return false
+}
+
+// parseCandidateKinds reads a rule's "candidate_kinds" metadata: a
+// comma-separated list of the kinds that rule reports on. An empty or absent
+// value means every kind, which is what every rule did before kinds existed and
+// what rules that have not opted in still do.
+//
+// Scoping exists because SEC-161/162/163 share one matcher. Without it the rule
+// ID on a finding names the rule rather than the candidate, so the rule called
+// "High-entropy hex string" reported an identifier with no hex in it (#467).
+func parseCandidateKinds(rule *Rule) map[candidateKind]bool {
+	raw := strings.TrimSpace(rule.Metadata["candidate_kinds"])
+	if raw == "" {
+		return nil
+	}
+	kinds := map[candidateKind]bool{}
+	for _, part := range strings.Split(raw, ",") {
+		if k := candidateKind(strings.TrimSpace(part)); k != "" {
+			kinds[k] = true
+		}
+	}
+	if len(kinds) == 0 {
+		return nil
+	}
+	return kinds
+}
+
 // EntropyMatcher implements the Matcher interface using Shannon entropy
 // analysis. It extracts candidate strings from file content using multiple
 // tokenizers (quoted strings, assignment RHS values, base64 blobs, hex
@@ -63,6 +123,7 @@ func (m *EntropyMatcher) Match(content []byte, rule *Rule) []MatchResult {
 	}
 
 	requireContext := rule.Metadata["require_context"] == "true"
+	wantKinds := parseCandidateKinds(rule)
 
 	lines := bytes.Split(content, []byte("\n"))
 	var results []MatchResult
@@ -90,38 +151,57 @@ func (m *EntropyMatcher) Match(content []byte, rule *Rule) []MatchResult {
 		// column positions. Use a map keyed by "col:text" to deduplicate
 		// overlapping extractions.
 		type candidate struct {
-			col  int
-			text string
+			col   int
+			text  string
+			kinds map[candidateKind]bool
 		}
-		seen := make(map[string]struct{})
+		index := make(map[string]int)
 		var candidates []candidate
 
-		addCandidate := func(col int, text string) {
-			key := strconv.Itoa(col) + ":" + text
-			if _, dup := seen[key]; dup {
-				return
+		// collectAs returns an add function that records kind against the
+		// (column, text) pair, unioning with any kind already recorded there.
+		// Tokenizer order is therefore irrelevant.
+		collectAs := func(kind candidateKind) func(int, string) {
+			return func(col int, text string) {
+				key := strconv.Itoa(col) + ":" + text
+				if i, dup := index[key]; dup {
+					candidates[i].kinds[kind] = true
+					return
+				}
+				index[key] = len(candidates)
+				candidates = append(candidates, candidate{
+					col: col, text: text, kinds: map[candidateKind]bool{kind: true},
+				})
 			}
-			seen[key] = struct{}{}
-			candidates = append(candidates, candidate{col: col, text: text})
 		}
 
 		// Tokenizer 1: quoted strings (single and double quoted, >= minCandidateLen chars).
-		extractQuoted(lineStr, addCandidate)
+		extractQuoted(lineStr, collectAs(candidateQuoted))
 
 		// Tokenizer 2: assignment RHS values.
-		extractAssignmentRHS(lineStr, addCandidate)
+		extractAssignmentRHS(lineStr, collectAs(candidateAssignment))
 
 		// Tokenizer 3: base64 blobs (30+ chars).
-		extractRegexCandidates(lineStr, base64Re, 30, addCandidate)
+		extractRegexCandidates(lineStr, base64Re, 30, collectAs(candidateBase64))
 
 		// Tokenizer 4: hex strings (32+ chars).
-		extractRegexCandidates(lineStr, hexRe, 32, addCandidate)
+		extractRegexCandidates(lineStr, hexRe, 32, collectAs(candidateHex))
 
 		for _, c := range candidates {
+			if !candidateMatchesKinds(c.kinds, wantKinds) {
+				continue
+			}
 			if len(c.text) < minCandidateLen {
 				continue
 			}
 			if isLikelyNotSecret(c.text) {
+				continue
+			}
+			// Subresource Integrity (SRI) hashes — a base64 digest prefixed by
+			// its algorithm (sha256-/sha384-/sha512-) in HTML/JSX/struct tags —
+			// are public integrity values, not credentials. Skip a candidate
+			// whose base64 body is immediately preceded by an SRI prefix.
+			if isSRIIntegrityHash(lineStr, c.col) {
 				continue
 			}
 			entropy := ShannonEntropy(c.text)
@@ -239,6 +319,20 @@ func extractAssignmentRHS(line string, addFn func(col int, text string)) {
 		}
 
 		token := line[rhsStart:rhsEnd]
+		// A token immediately followed by '(' is a function or method call, not
+		// a value. This matters because ':' is treated as an assignment operator
+		// above, which is correct for YAML/JSON (`api_key: abc…`) but also fires
+		// on a struct-literal field in Go, Rust or Swift:
+		//
+		//	Hook: domain.PrePush.ConfigKey(),
+		//
+		// There the "RHS" is the selector expression `domain.PrePush.ConfigKey`,
+		// which has no value at scan time. A literal secret is never followed by
+		// an open paren, so skipping calls costs no recall.
+		if rhsEnd < len(line) && line[rhsEnd] == '(' {
+			i = rhsEnd
+			continue
+		}
 		if len(token) >= 16 {
 			addFn(rhsStart+1, token) // 1-based column
 		}
@@ -274,6 +368,19 @@ func extractRegexCandidates(line string, re *regexp.Regexp, minLen int, addFn fu
 // git SHAs, Go import paths, file paths, camelCase identifiers, version
 // strings, and other patterns that would cause false positives.
 func isLikelyNotSecret(s string) bool {
+	// Natural-language prose, SQL, error-message format strings, and prompt
+	// templates contain internal whitespace; a compact secret token — API key,
+	// token, hash, base64/hex blob — never does. This is the dominant
+	// false-positive source for the generic entropy detectors on prose-heavy
+	// codebases: a 120-char English sentence has high aggregate entropy but is
+	// not a credential (#104). Real base64/hex secrets are still caught, because
+	// the base64/hex tokenizers extract the token itself (no surrounding
+	// whitespace) — only the whole-string quoted/assignment candidates carry
+	// prose, and a real secret in a quoted string is the compact token anyway.
+	if strings.ContainsAny(s, " \t") {
+		return true
+	}
+
 	// URLs starting with http:// or https://.
 	lower := strings.ToLower(s)
 	if strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") {
@@ -335,7 +442,63 @@ func isLikelyNotSecret(s string) bool {
 		return true
 	}
 
+	// SCREAMING_SNAKE_CASE constant names (e.g. DEFAULT_THREAD_ID_KEY).
+	if isScreamingSnakeCase(s) {
+		return true
+	}
+
+	// All-lowercase snake_case or dot-separated attribute access chains
+	// (e.g. resolved_options.run_context_thread_id_key). Real secret tokens
+	// never follow this pattern.
+	if isLowercaseDotChain(s) {
+		return true
+	}
+
+	// Template expressions — contain '{' and '}' (Python f-strings, shell
+	// variable substitutions). Template placeholders are never raw credentials.
+	if containsTemplateBraces(s) {
+		return true
+	}
+
 	return false
+}
+
+// sriPrefixes are the algorithm labels that precede the base64 body of a
+// Subresource Integrity hash, e.g. sha384-<base64>.
+var sriPrefixes = []string{"sha256-", "sha384-", "sha512-"}
+
+// isSRIIntegrityHash reports whether the candidate string beginning at the
+// given 1-based column in line is the base64 body of a Subresource Integrity
+// (SRI) hash — i.e. immediately preceded by an SRI algorithm prefix such as
+// "sha384-". Such hashes are public content digests, never secrets, so they
+// must not fire the entropy detectors. The prefix must be a whole token: the
+// character before it (if any) must not be alphanumeric, so "mysha384-…" (a
+// coincidental substring) is not treated as SRI.
+func isSRIIntegrityHash(line string, col int) bool {
+	// col is 1-based; the candidate starts at byte index col-1.
+	start := col - 1
+	if start < 0 || start > len(line) {
+		return false
+	}
+	prefixRegion := strings.ToLower(line[:start])
+	for _, p := range sriPrefixes {
+		if !strings.HasSuffix(prefixRegion, p) {
+			continue
+		}
+		before := len(prefixRegion) - len(p)
+		if before == 0 {
+			return true
+		}
+		if b := prefixRegion[before-1]; !isAlphaNum(b) {
+			return true
+		}
+	}
+	return false
+}
+
+// isAlphaNum reports whether b is an ASCII letter or digit.
+func isAlphaNum(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
 }
 
 // isAllHex returns true if every character in s is a hexadecimal digit.
@@ -433,4 +596,63 @@ func isAllUpperAlpha(s string) bool {
 		}
 	}
 	return true
+}
+
+// isScreamingSnakeCase returns true if s consists only of uppercase ASCII
+// letters, digits, and underscores with at least one underscore. These are
+// constant names (e.g. DEFAULT_RUN_CONTEXT_THREAD_ID_KEY) and are never
+// credentials.
+func isScreamingSnakeCase(s string) bool {
+	if len(s) < 4 {
+		return false
+	}
+	hasUnderscore := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == '_':
+			hasUnderscore = true
+		case c >= 'A' && c <= 'Z':
+			// ok
+		case c >= '0' && c <= '9':
+			// ok
+		default:
+			return false
+		}
+	}
+	return hasUnderscore
+}
+
+// isLowercaseDotChain returns true if s consists only of lowercase ASCII
+// letters, digits, underscores, and dots with at least one underscore. These
+// are snake_case variable names or attribute access chains
+// (e.g. resolved_options.run_context_thread_id_key) and are never credentials.
+func isLowercaseDotChain(s string) bool {
+	if len(s) < 4 {
+		return false
+	}
+	hasUnderscore := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == '_':
+			hasUnderscore = true
+		case c == '.':
+			// ok — dot-separated attribute access
+		case c >= 'a' && c <= 'z':
+			// ok
+		case c >= '0' && c <= '9':
+			// ok
+		default:
+			return false
+		}
+	}
+	return hasUnderscore
+}
+
+// containsTemplateBraces returns true if s contains both '{' and '}',
+// indicating a template expression (Python f-strings, shell variable
+// substitution, etc.). Template placeholders are never raw credentials.
+func containsTemplateBraces(s string) bool {
+	return strings.ContainsRune(s, '{') && strings.ContainsRune(s, '}')
 }

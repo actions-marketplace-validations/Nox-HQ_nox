@@ -12,8 +12,11 @@ import (
 
 func TestExpandedRules_Count(t *testing.T) {
 	rules := builtinExpandedIaCRules()
-	if got := len(rules); got != 235 {
-		t.Errorf("expected 235 expanded rules, got %d", got)
+	// 226, not the original 235: nine expanded rules (IAC-283, IAC-287,
+	// IAC-291, IAC-292, IAC-310, IAC-312, IAC-321, IAC-333, IAC-337) were
+	// retired in #394 because a base rule already reported their condition.
+	if got := len(rules); got != 226 {
+		t.Errorf("expected 226 expanded rules, got %d", got)
 	}
 }
 
@@ -218,7 +221,10 @@ func TestExpandedDetect_IAC281_ForceDestroyEnabled(t *testing.T) {
 	}
 }
 
-func TestExpandedDetect_IAC283_PubliclyAccessible(t *testing.T) {
+// IAC-283 was retired into IAC-036, which reported the same condition at
+// critical. The fixture is unchanged: what must not change is that the
+// condition is still detected -- once.
+func TestExpandedDetect_IAC283_RetiredIntoIAC036_PubliclyAccessible(t *testing.T) {
 	a := NewAnalyzer()
 	content := []byte(`resource "aws_db_instance" "default" {
   publicly_accessible = true
@@ -228,18 +234,7 @@ func TestExpandedDetect_IAC283_PubliclyAccessible(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	found := false
-	for _, f := range results {
-		if f.RuleID == "IAC-283" {
-			found = true
-			if f.Severity != findings.SeverityHigh {
-				t.Errorf("expected severity high, got %s", f.Severity)
-			}
-		}
-	}
-	if !found {
-		t.Error("expected IAC-283 to be detected")
-	}
+	assertRetiredIntoSurvivor(t, results, "IAC-283", "IAC-036", findings.SeverityCritical)
 }
 
 func TestExpandedDetect_IAC285_MultiAZFalse(t *testing.T) {
@@ -488,6 +483,56 @@ jobs:
 	}
 }
 
+// TestExpandedDetect_IAC351_HardcodedSecret verifies that IAC-351 fires on
+// genuine hardcoded secret variables but does NOT fire on GHA OIDC permission
+// lines (`id-token: write`), which previously triggered a critical false positive
+// because the unanchored TOKEN pattern matched the suffix of `id-token`.
+func TestExpandedDetect_IAC351_HardcodedSecret(t *testing.T) {
+	a := NewAnalyzer()
+
+	// TRUE POSITIVE: a real hardcoded token variable in a GitLab CI file.
+	tpContent := []byte(`variables:
+  DEPLOY_TOKEN: hardcoded123secret
+  OTHER_VAR: safe
+`)
+	tpResults, err := a.ScanFile(".gitlab-ci.yml", tpContent)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	found := false
+	for _, f := range tpResults {
+		if f.RuleID == "IAC-351" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("IAC-351: expected finding on hardcoded TOKEN variable, got none")
+	}
+
+	// FALSE POSITIVE guard: GHA OIDC permission line must NOT trigger IAC-351.
+	fpContent := []byte(`name: Deploy
+on: push
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+`)
+	fpResults, err := a.ScanFile(".github/workflows/deploy.yml", fpContent)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, f := range fpResults {
+		if f.RuleID == "IAC-351" {
+			t.Errorf("IAC-351 false positive: fired on 'id-token: write' GHA permission line at %s:%d",
+				f.Location.FilePath, f.Location.StartLine)
+		}
+	}
+}
+
 func TestExpandedDetect_IAC308_WorkflowDispatch(t *testing.T) {
 	a := NewAnalyzer()
 	// keywords: ["workflow_dispatch"] -- lowercase
@@ -536,15 +581,7 @@ jobs:
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	found := false
-	for _, f := range results {
-		if f.RuleID == "IAC-310" {
-			found = true
-		}
-	}
-	if !found {
-		t.Error("expected IAC-310 to be detected")
-	}
+	assertRetiredIntoSurvivor(t, results, "IAC-310", "IAC-018", findings.SeverityLow)
 }
 
 func TestExpandedDetect_IAC314_ContentsWrite(t *testing.T) {
@@ -637,7 +674,8 @@ jobs:
 // Azure (IAC-321 to IAC-330) -- these use .tf files
 // ---------------------------------------------------------------------------
 
-func TestExpandedDetect_IAC321_AzureHTTPTraffic(t *testing.T) {
+// IAC-321 was retired into IAC-042 (#394), same condition, same severity.
+func TestExpandedDetect_IAC321_RetiredIntoIAC042_AzureHTTPTraffic(t *testing.T) {
 	a := NewAnalyzer()
 	content := []byte(`resource "azurerm_storage_account" "main" {
   name                      = "mystorageaccount"
@@ -648,18 +686,7 @@ func TestExpandedDetect_IAC321_AzureHTTPTraffic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	found := false
-	for _, f := range results {
-		if f.RuleID == "IAC-321" {
-			found = true
-			if f.Severity != findings.SeverityHigh {
-				t.Errorf("expected severity high, got %s", f.Severity)
-			}
-		}
-	}
-	if !found {
-		t.Error("expected IAC-321 to be detected")
-	}
+	assertRetiredIntoSurvivor(t, results, "IAC-321", "IAC-042", findings.SeverityHigh)
 }
 
 func TestExpandedDetect_IAC324_AzureAdminEnabled(t *testing.T) {
@@ -728,18 +755,7 @@ func TestExpandedDetect_IAC337_GCPRequireSSLFalse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	found := false
-	for _, f := range results {
-		if f.RuleID == "IAC-337" {
-			found = true
-			if f.Severity != findings.SeverityHigh {
-				t.Errorf("expected severity high, got %s", f.Severity)
-			}
-		}
-	}
-	if !found {
-		t.Error("expected IAC-337 to be detected")
-	}
+	assertRetiredIntoSurvivor(t, results, "IAC-337", "IAC-116", findings.SeverityHigh)
 }
 
 func TestExpandedDetect_IAC338_GCPAllIPsAuthorized(t *testing.T) {

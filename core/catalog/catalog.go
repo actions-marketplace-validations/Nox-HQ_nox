@@ -9,11 +9,20 @@
 package catalog
 
 import (
+	"github.com/nox-hq/nox/core/analyzers/agentflow"
 	"github.com/nox-hq/nox/core/analyzers/ai"
 	"github.com/nox-hq/nox/core/analyzers/data"
 	"github.com/nox-hq/nox/core/analyzers/deps"
+	"github.com/nox-hq/nox/core/analyzers/fileperms"
+	"github.com/nox-hq/nox/core/analyzers/hardening"
 	"github.com/nox-hq/nox/core/analyzers/iac"
+	"github.com/nox-hq/nox/core/analyzers/memsafe"
+	"github.com/nox-hq/nox/core/analyzers/provenance"
 	"github.com/nox-hq/nox/core/analyzers/secrets"
+	"github.com/nox-hq/nox/core/analyzers/slop"
+	"github.com/nox-hq/nox/core/analyzers/taintflow"
+	"github.com/nox-hq/nox/core/analyzers/variants"
+	"github.com/nox-hq/nox/core/analyzers/weakcrypto"
 	"github.com/nox-hq/nox/core/rules"
 )
 
@@ -51,6 +60,18 @@ func allRuleSets() []*rules.RuleSet {
 		ai.NewAnalyzer().Rules(),
 		iac.NewAnalyzer().Rules(),
 		deps.NewAnalyzer(deps.WithOSVDisabled()).Rules(),
+		slop.NewAnalyzer().Rules(),
+		variants.NewAnalyzer().Rules(),
+		provenance.NewAnalyzer().Rules(),
+		// These six publish rules too, and were missing: their findings appeared
+		// in scans while `nox rules` and the MCP rules tool denied the rules
+		// existed, and any metadata join by rule ID came back empty for them.
+		agentflow.NewAnalyzer().Rules(),
+		taintflow.NewAnalyzer().Rules(),
+		weakcrypto.NewAnalyzer().Rules(),
+		hardening.NewAnalyzer().Rules(),
+		memsafe.NewAnalyzer().Rules(),
+		fileperms.NewAnalyzer().Rules(),
 	}
 }
 

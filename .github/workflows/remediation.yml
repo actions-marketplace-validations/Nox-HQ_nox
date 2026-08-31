@@ -1,32 +1,34 @@
 name: Nox Remediation
 
+# Thin caller for the org-wide reusable workflow. Everything real — the pinned
+# nox version, the scan/fix/verify sequence, the token fallback — lives in
+# Nox-HQ/.github so a version bump happens once for every repository instead of
+# 21 times.
+#
+# Action-pin remediation additionally needs a NOX_TOKEN secret: the default
+# GITHUB_TOKEN cannot push changes under .github/workflows, and that scope is
+# not grantable through `permissions:`. Without it this still remediates
+# dependencies in full.
 on:
   schedule:
-    - cron: '0 3 * * 1-5'
-  workflow_dispatch:
+    # Weekly Mon 03:00 UTC.
+    - cron: '0 3 * * 1'
+  workflow_dispatch: # nox:ignore IAC-308 -- remediation is run on demand as well as on schedule
+    inputs:
+      include-major:
+        description: 'Apply major-version bumps too (off by default; review manually).'
+        type: boolean
+        default: false
 
 permissions:
-  contents: write
+  contents: write # nox:ignore IAC-314 -- opens the remediation PR
   pull-requests: write
 
 jobs:
   remediate:
-    name: Scan and propose dependency upgrades
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          fetch-depth: 0
-
-      - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
-        with:
-          go-version-file: go.mod
-
-      - uses: nox-hq/nox-remediate-action@v1
-        with:
-          path: .
-          manifest-root: .
-          # Run the full test suite before opening the PR so reviewers
-          # don't get untested upgrades.
-          verify-cmd: 'go test ./...'
-          pr-labels: 'security,dependencies,nox-remediation'
+    uses: Nox-HQ/.github/.github/workflows/nox-remediate.yml@main
+    secrets: inherit
+    with:
+      include-major: ${{ inputs.include-major || false }}
+      # nox's own suite is the gate on its own dependency upgrades.
+      verify-cmd: 'go test ./... -count=1'

@@ -92,6 +92,28 @@ func handleScan(ctx context.Context, req sdk.ToolRequest) (*pluginv1.InvokeToolR
 }
 ```
 
+### Reporting a dataflow
+
+A plugin that reports a source→sink flow under a rule ID core also emits
+(`TAINT-*`) must say which flow it found, or the same vulnerability is
+reported twice: core anchors a flow at its sink, plugins commonly anchor at
+the source, and the two locations and wordings give two fingerprints that no
+baseline can suppress together.
+
+Emit three metadata keys and nox will collapse the pair, keeping the sink
+anchor:
+
+```go
+    .WithMetadata("source_line", "11").  // where the untrusted value entered
+    .WithMetadata("source_var", "q").    // the tainted identifier
+    .WithMetadata("sink_line", "12").    // where it reached the sink
+```
+
+Omit `sink_line` if the finding is already located at the sink. A finding
+missing `source_line` or `source_var` is not treated as a flow report and is
+never collapsed — including a flow no other analyzer found, which is always
+kept.
+
 ### Tool Request
 
 ```go
@@ -104,7 +126,40 @@ type ToolRequest struct {
 
 ## Safety Model
 
-Every plugin declares its safety requirements in the manifest. The host validates these against the active policy before allowing registration.
+Every plugin declares its safety requirements in the manifest, and may additionally declare them **per tool**. The host validates the plugin-level block at registration, and the specific tool's requirements at invocation.
+
+### Plugin-level vs per-tool safety
+
+The plugin-level `Safety(...)` block is the **ceiling** — everything the plugin might ever need, declared up front so an operator can see it before anything runs. Individual tools may declare narrower requirements with `ToolSafety(...)`:
+
+```go
+Capability("red-team", "Attack path analysis").
+    // Reasons over findings the core scan already produced: no network,
+    // no mutation, nothing to confirm.
+    Tool("analyze", "Detect attack chains", true).
+    ToolSafety(sdk.WithRiskClass(sdk.RiskPassive)).
+    // Probes a live target, so it stays opt-in.
+    Tool("validate", "Validate exploitability", false).
+    ToolSafety(
+        sdk.WithRiskClass(sdk.RiskActive),
+        sdk.WithNeedsConfirmation(),
+        sdk.WithNetworkHosts("*"),
+    ).
+    Done().
+    Safety(  // the ceiling across both tools
+        sdk.WithRiskClass(sdk.RiskActive),
+        sdk.WithNeedsConfirmation(),
+        sdk.WithNetworkHosts("*"),
+    )
+```
+
+A tool with no `ToolSafety` inherits the plugin-level block, so plugins written before this existed behave exactly as they did.
+
+**Why it exists.** Safety used to be plugin-scoped only, and validated at registration. A plugin bundling tools with different needs had to declare the union — the strictest requirement of any one tool — and that union then gated *every* tool it shipped. `nox/red-team` could not run its read-only `analyze` under a passive policy purely because it also ships `validate`.
+
+Registration therefore now asks *"is at least one tool usable under this policy?"*, and the binding check happens per invocation.
+
+> **`read_only` does not mean passive.** It means "does not mutate the workspace". A read-only tool may still send data to the network — `nox/llm-triage` declares a read-only tool that ships source code to an external chat endpoint. Declare `ToolSafety` honestly per tool; do not infer passiveness from `readOnly: true`, and do not copy the narrowest block onto a tool that needs more. The host enforces exactly what you declare.
 
 ### Risk Classes
 
@@ -128,7 +183,7 @@ sdk.WithMaxArtifactBytes(50 * 1024 * 1024)   // Maximum artifact size
 
 ### Track-Specific Profiles
 
-Each track has pre-built safety profiles. Use `plugin.ProfileForTrack(track)` to get defaults:
+`plugin.ProfileForTrack(track)` returns a suggested policy per track:
 
 | Track | Risk | Network | Confirmation |
 |-------|------|---------|-------------|
@@ -137,6 +192,52 @@ Each track has pre-built safety profiles. Use `plugin.ProfileForTrack(track)` to
 | ai-security | passive | none | no |
 | supply-chain | passive | *.osv.dev, *.github.com | no |
 | agent-assistance | passive | LLM APIs | no |
+
+These profiles are **enforced**. The host resolves each plugin's policy as its
+track profile merged with the operator's `.nox.yaml` `plugin_policy` block,
+where operator settings win. A `dynamic-runtime` plugin therefore gets
+localhost access without the operator configuring anything, and a
+`core-analysis` plugin does not — even in the same scan, since policy is
+per-plugin rather than host-wide.
+
+### Where the track comes from
+
+**The track is read from the registry entry your plugin was published under,
+captured at install time — never from your manifest.** The gRPC manifest
+carries no track field by design: a self-declared track would let a plugin
+choose its own sandbox, which is not a sandbox.
+
+The practical consequences:
+
+- A plugin installed with `--local` has no registry entry, so it has **no
+  track** and runs under the strict default policy: `passive` risk class, empty
+  allowlists. Declaring `network_hosts` in a sideloaded plugin means rejection
+  at registration. Test your plugin as installed from a registry, not only
+  sideloaded, or you will not exercise the policy it actually runs under.
+- Plugins installed before tracks were recorded also have no track and get the
+  strict default until reinstalled.
+
+If your plugin needs more than its track grants, the operator must opt in:
+
+```yaml
+# .nox.yaml
+plugin_policy:
+  max_risk_class: active
+  allowed_network_hosts: ["localhost", "127.0.0.1"]
+```
+
+Operators who want the pre-track behaviour — every plugin on the strict default
+regardless of track — set:
+
+```yaml
+plugin_policy:
+  ignore_track_profiles: true
+```
+
+This exists because the override semantics are one-directional: an operator can
+widen an allowlist but cannot empty one, since a zero-length list reads as "not
+configured". Without the flag there would be no way to revoke the localhost
+access the `dynamic-runtime` profile grants.
 
 ## Testing
 

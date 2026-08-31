@@ -1,0 +1,101 @@
+{
+  "precision": 1,
+  "recall": 1,
+  "f1": 1,
+  "fp": 0,
+  "tp": 37,
+  "fn": 0,
+  "findings_per_issue": 1.0571428571428572,
+  "rules": [
+    {
+      "rule_id": "AI-002",
+      "precision": 1,
+      "recall": 1
+    },
+    {
+      "rule_id": "DATA-001",
+      "precision": 1,
+      "recall": 1
+    },
+    {
+      "rule_id": "DATA-005",
+      "precision": 1,
+      "recall": 1
+    },
+    {
+      "rule_id": "SEC-001",
+      "precision": 1,
+      "recall": 1
+    },
+    {
+      "rule_id": "SEC-003",
+      "precision": 1,
+      "recall": 1
+    },
+    {
+      "rule_id": "SEC-007",
+      "precision": 1,
+      "recall": 1
+    },
+    {
+      "rule_id": "SEC-023",
+      "precision": 1,
+      "recall": 1
+    },
+    {
+      "rule_id": "SEC-030",
+      "precision": 1,
+      "recall": 1
+    },
+    {
+      "rule_id": "SEC-508",
+      "precision": 1,
+      "recall": 1
+    },
+    {
+      "rule_id": "SLOP-001",
+      "precision": 1,
+      "recall": 1
+    },
+    {
+      "rule_id": "TAINT-001",
+      "precision": 1,
+      "recall": 1
+    },
+    {
+      "rule_id": "TAINT-002",
+      "precision": 1,
+      "recall": 1
+    },
+    {
+      "rule_id": "TAINT-003",
+      "precision": 1,
+      "recall": 1
+    },
+    {
+      "rule_id": "TAINT-004",
+      "precision": 1,
+      "recall": 1
+    },
+    {
+      "rule_id": "TAINT-005",
+      "precision": 1,
+      "recall": 1
+    },
+    {
+      "rule_id": "TAINT-006",
+      "precision": 1,
+      "recall": 1
+    },
+    {
+      "rule_id": "VARIANT-002",
+      "precision": 1,
+      "recall": 1
+    },
+    {
+      "rule_id": "VARIANT-005",
+      "precision": 1,
+      "recall": 1
+    }
+  ]
+}

@@ -1,5 +1,10 @@
 # Binary
 /nox
+# Binaries from `go build ./cmd/<name>`, which writes to the working directory.
+# /nox was listed but each new command needed its own line, and one was missed:
+# an 8.9 MB darwin/arm64 binary reached main. Cover them by pattern instead.
+/registry-sync
+/marketplace-build
 
 # GoReleaser
 dist/
@@ -36,6 +41,13 @@ sbom.cdx.json
 sbom.spdx.json
 ai.inventory.json
 explanations.json
+confirmations.json
+
+# Dynamic exploit validation artifacts
+attack.plan.json
+attack.trace.json
+attack.cases.json
+attack.regress.json
 
 # Coverage
 .cover/
@@ -51,3 +63,8 @@ cli/.github/
 
 # Relicta
 .relicta/
+
+# Local tool scratch: an MCP server writes SHA-named idempotency markers
+# ("session" / "durable", 7 bytes each) into ./data/cache/ of whatever
+# directory it is launched from. Not produced by nox and not project data.
+/data/cache/

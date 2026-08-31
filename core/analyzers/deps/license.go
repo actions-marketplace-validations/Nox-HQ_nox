@@ -10,7 +10,6 @@
 package deps
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/json"
 	"encoding/xml"
@@ -149,24 +148,24 @@ func matchesLicenseList(license string, list []string) bool {
 // name to license string.
 func detectNPMLicenses(basePath string) map[string]string {
 	result := make(map[string]string)
+
+	// Read the root manifest's own license if present. A missing or malformed
+	// root package.json must not stop us: the dependency licences actually
+	// evaluated live in node_modules, and returning early here meant a project
+	// without a readable root manifest got no license findings whatsoever.
 	path := filepath.Join(basePath, "package.json")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return result
-	}
-
-	var pkg struct {
-		Name    string          `json:"name"`
-		License json.RawMessage `json:"license"`
-	}
-	if err := json.Unmarshal(data, &pkg); err != nil {
-		return result
-	}
-
-	// The license field can be a string or an object {type: "MIT"}.
-	license := extractJSONLicense(pkg.License)
-	if license != "" && pkg.Name != "" {
-		result[pkg.Name] = license
+	if data, err := os.ReadFile(path); err == nil {
+		var pkg struct {
+			Name    string          `json:"name"`
+			License json.RawMessage `json:"license"`
+		}
+		if err := json.Unmarshal(data, &pkg); err == nil {
+			// The license field can be a string or an object {type: "MIT"}.
+			license := extractJSONLicense(pkg.License)
+			if license != "" && pkg.Name != "" {
+				result[pkg.Name] = license
+			}
+		}
 	}
 
 	// Read license info from node_modules package.json files.
@@ -277,7 +276,7 @@ func detectCargoLicenses(basePath string) map[string]string {
 func parseCargoTOMLLicense(data []byte) (name, license string) {
 	inPackage := false
 
-	scanner := bufio.NewScanner(bytes.NewReader(data))
+	scanner := newLineScanner(bytes.NewReader(data))
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 
@@ -378,7 +377,7 @@ func parsePyprojectTOML(path string) (name, license string) {
 
 	inProject := false
 
-	scanner := bufio.NewScanner(bytes.NewReader(data))
+	scanner := newLineScanner(bytes.NewReader(data))
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 
@@ -416,7 +415,7 @@ func parseSetupCfg(path string) (name, license string) {
 
 	inMetadata := false
 
-	scanner := bufio.NewScanner(bytes.NewReader(data))
+	scanner := newLineScanner(bytes.NewReader(data))
 	for scanner.Scan() {
 		line := scanner.Text()
 		trimmed := strings.TrimSpace(line)
@@ -555,7 +554,7 @@ func parseGemspec(path string) (name, license string) {
 		return "", ""
 	}
 
-	scanner := bufio.NewScanner(bytes.NewReader(data))
+	scanner := newLineScanner(bytes.NewReader(data))
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 

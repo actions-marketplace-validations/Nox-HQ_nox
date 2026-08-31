@@ -1,6 +1,6 @@
 {
   "project_id": "nox",
-  "version": 161,
+  "version": 188,
   "task_states": {
     "task-1": {
       "status": "verified",
@@ -593,6 +593,83 @@
       "completed_at": "2026-05-09T07:34:39.116875+02:00",
       "elapsed_minutes": 4
     },
+    "task-63": {
+      "status": "done",
+      "path": "",
+      "owner": "ai-agent",
+      "evidence": [
+        "MCP-009..014 added to core/analyzers/ai/rules.go; TestDetect_MCPToolPoisoning + benign-no-fire pass; fixed RE2-invalid AI-037/AI-039; catalog 1525-\u003e1531; go build/vet/test green"
+      ],
+      "started_at": "2026-06-05T10:48:54.856908+02:00",
+      "completed_at": "2026-06-05T10:52:57.616572+02:00",
+      "elapsed_minutes": 4
+    },
+    "task-64": {
+      "status": "done",
+      "path": "",
+      "owner": "ai-agent",
+      "evidence": [
+        "TestDetect_MCPToolPoisoning (6 cases MCP-009..014) + benign-no-fire + MCPPrecision corpus (comments/test-files/SSRF-blocklist/real-poison + MCP-011/019 refinement tests) in core/analyzers/ai/ai_test.go"
+      ],
+      "started_at": "2026-06-05T12:30:18.370079+02:00",
+      "completed_at": "2026-06-05T12:30:23.765932+02:00",
+      "elapsed_minutes": 0
+    },
+    "task-65": {
+      "status": "done",
+      "path": "",
+      "owner": "ai-agent",
+      "evidence": [
+        "core/mcppin package: MCP-015 rug-pull detection via pinned canonical SHA-256, atomic on-disk store; 8 tests (first-run/no-drift/key-order/drift-once/persistence/clear/non-mcp) green; committed af4284c on main"
+      ],
+      "started_at": "2026-06-05T11:00:57.949335+02:00",
+      "completed_at": "2026-06-05T11:05:24.093493+02:00",
+      "elapsed_minutes": 4
+    },
+    "task-66": {
+      "status": "done",
+      "path": "",
+      "owner": "ai-agent",
+      "evidence": [
+        "MCP-016..021 added (token passthrough, confused deputy, cloud-metadata SSRF, private-range SSRF, predictable session, session-as-auth); spec-anchored; TestDetect_MCPAuthorization + benign-no-fire green; AI 81 / catalog 1537"
+      ],
+      "started_at": "2026-06-05T11:05:52.997359+02:00",
+      "completed_at": "2026-06-05T11:08:39.826563+02:00",
+      "elapsed_minutes": 2
+    },
+    "task-67": {
+      "status": "done",
+      "path": "",
+      "owner": "ai-agent",
+      "evidence": [
+        "MCP-022 regex (unpinned remote server) + core/mcpshadow relational pass for MCP-023 (server-name impersonation across configs) and MCP-024 (tool-name shadowing across servers); 8 tests green; AI 82 / catalog 1538"
+      ],
+      "started_at": "2026-06-05T11:14:46.768049+02:00",
+      "completed_at": "2026-06-05T11:17:11.073696+02:00",
+      "elapsed_minutes": 2
+    },
+    "task-68": {
+      "status": "done",
+      "path": "",
+      "owner": "ai-agent",
+      "evidence": [
+        "core/discovery/mcpclients.go: 17-client config registry (per-OS, pure KnownClientConfigs + ResolveExistingClientConfigs); extended isAIComponent for MCP config filenames + *.mcp.json; per-OS fixture tests green"
+      ],
+      "started_at": "2026-06-05T11:11:58.09181+02:00",
+      "completed_at": "2026-06-05T11:14:07.322453+02:00",
+      "elapsed_minutes": 2
+    },
+    "task-69": {
+      "status": "done",
+      "path": "",
+      "owner": "ai-agent",
+      "evidence": [
+        "core/compliance OWASP MCP Top 10 framework + rule-\u003econtrol mapping (test-enforced over catalog); SARIF emits owasp-mcp + tags array; tests green"
+      ],
+      "started_at": "2026-06-05T11:21:02.419725+02:00",
+      "completed_at": "2026-06-05T11:21:06.091539+02:00",
+      "elapsed_minutes": 0
+    },
     "task-7": {
       "status": "verified",
       "path": "",
@@ -600,6 +677,61 @@
       "evidence": [
         "JSON findings output implemented in core/report/ with Reporter interface, JSONReporter, ReportMeta, WriteToFile. 6 tests all passing. Standard library only."
       ],
+      "elapsed_minutes": 0
+    },
+    "task-70": {
+      "status": "done",
+      "path": "",
+      "owner": "ai-agent",
+      "evidence": [
+        "ScanOptions.Offline umbrella flag + --offline CLI flag; deps network-tripwire tests (OSV-disabled no egress + positive control); RunScan offline smoke; README no-telemetry positioning + enforced-by-test claim; full suite green"
+      ],
+      "started_at": "2026-06-05T11:31:28.952928+02:00",
+      "completed_at": "2026-06-05T11:34:57.643339+02:00",
+      "elapsed_minutes": 3
+    },
+    "task-71": {
+      "status": "done",
+      "path": "",
+      "owner": "ai-agent",
+      "evidence": [
+        "Build: offline action input + examples/mcp-scan-before-publish workflow. Dogfood: scanned 17 own MCP repos, triaged all retained findings (0 genuine vulns), drove 2 precision rounds. Draft writeup at docs/blog-draft-dogfooding-mcp.md pending user review (publishing user-gated)"
+      ],
+      "started_at": "2026-06-05T12:30:27.230824+02:00",
+      "completed_at": "2026-06-05T12:30:31.493415+02:00",
+      "elapsed_minutes": 0
+    },
+    "task-72": {
+      "status": "done",
+      "path": "",
+      "owner": "ai-agent",
+      "evidence": [
+        "Integration contract docs/mcp-registry-integration.md (cosign-verified image, --network=none offline scan, exit-code gate, SARIF schema) + outreach draft docs/mcp-catalog-outreach-draft.md (targets: Docker MCP Catalog, official registry, aggregators). Sending is user-gated."
+      ],
+      "started_at": "2026-06-05T13:11:20.370468+02:00",
+      "completed_at": "2026-06-05T13:11:25.789637+02:00",
+      "elapsed_minutes": 0
+    },
+    "task-73": {
+      "status": "done",
+      "path": "",
+      "owner": "ai-agent",
+      "evidence": [
+        "Engine precision filters (IgnoreInComments + windowed ExcludeContextKeywords) + test-file globs on MCP-009/010/011/013/014/018/019; 4 precision tests + positive control; dogfood re-scan: preflight 8-\u003e0, chronos/coverctl 1-\u003e0, temper 6-\u003e3, nomi 4-\u003e1, roady 7-\u003e5, tokenops 4-\u003e1; total findings unchanged"
+      ],
+      "started_at": "2026-06-05T12:22:45.429293+02:00",
+      "completed_at": "2026-06-05T12:22:50.377785+02:00",
+      "elapsed_minutes": 0
+    },
+    "task-74": {
+      "status": "done",
+      "path": "",
+      "owner": "ai-agent",
+      "evidence": [
+        "AI-033/036 pattern bugs fixed, AI-026 tightened, test/doc ignore for AI-006/008/026/036/039, content-based generated detection (banner+minified) in AI analyzer; validated cloudflare AI-033-\u003e0, mongodb 38-\u003e6, top-26 scan 0 TP/0 disclosure; CHANGELOG documented; commits 82682f0+51b8dd1"
+      ],
+      "started_at": "2026-06-05T13:07:34.723595+02:00",
+      "completed_at": "2026-06-05T13:07:40.026159+02:00",
       "elapsed_minutes": 0
     },
     "task-8": {
@@ -621,5 +753,5 @@
       "elapsed_minutes": 0
     }
   },
-  "updated_at": "2026-05-09T11:51:35.011239+02:00"
+  "updated_at": "2026-06-05T13:11:25.789639+02:00"
 }

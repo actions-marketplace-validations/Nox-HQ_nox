@@ -176,7 +176,11 @@ func installOne(name, constraint string, st *State) error {
 	}
 
 	client := newRegistryClient(st)
-	store := newOCIStore()
+	// Enforce the operator's trust policy here too: this path drives .nox.yaml
+	// plugins.required installs (including scan-time auto-install), so a
+	// fail-open store would auto-install an unverified plugin during a scan.
+	policyName := resolveTrustPolicy("", false, false, false)
+	store := newOCIStoreWithPolicy(policyName)
 	ctx := context.Background()
 
 	ve, err := client.Resolve(ctx, name, constraint)
@@ -192,17 +196,25 @@ func installOne(name, constraint string, st *State) error {
 		return fmt.Errorf("fetching: %w", err)
 	}
 
+	// Fail closed: never auto-install an artifact that violates the trust policy.
+	if msgs, fatal := trustViolationsBlock(artifact.VerifyResult, policyName, false); fatal {
+		return fmt.Errorf("blocked by trust policy %q: %s", policyName, strings.Join(msgs, "; "))
+	}
+
 	now := time.Now()
-	st.AddPlugin(&InstalledPlugin{
+	ip := &InstalledPlugin{
 		Name:        name,
 		Version:     ve.Version,
 		Digest:      artifact.Digest,
 		BinaryPath:  artifact.BinaryPath,
 		TrustLevel:  artifact.VerifyResult.Level.String(),
 		RiskClass:   ve.RiskClass,
+		Track:       string(trackForPlugin(ctx, client, name)),
 		InstalledAt: now,
 		UpdatedAt:   now,
-	})
+	}
+	ip.RecordBinaryDigest()
+	st.AddPlugin(ip)
 	return nil
 }
 
